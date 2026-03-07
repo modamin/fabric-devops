@@ -1,0 +1,284 @@
+parameters:
+  - name: environment
+    displayName: "Target Environment"
+    type: string
+    default: "UAT"
+    values:
+      - DEV
+      - UAT
+      - PROD
+
+  - name: targetWorkspaceId
+    displayName: "Target Fabric Workspace ID"
+    type: string
+    default: "f37cedbf-e37a-42e6-822f-b75b93cc8118"
+  
+  - name: devWorkspaceName
+    displayName: "Fabric Dev Workspace Name (for artifact capture)"
+    type: string
+    default: "cicd-conn-mgmt-dev"
+  
+  - name: uatWorkspaceName
+    displayName: "Fabric UAT Workspace Name"
+    type: string
+    default: "cicd-conn-mgmt-uat"
+  
+  
+  - name: groupId
+    displayName: "AAD Group ID to Grant Access"
+    type: string
+    default: "bd9da7e3-1acd-476b-9159-3674a310f890"
+
+  - name: initNotebookName
+    displayName: "Notebook Name to Run for Initialization"
+    type: string
+    default: "conn_mgmt_init_nb"
+
+  - name: userIds
+    displayName: "User Object IDs (comma-separated) to Grant Access"
+    type: string
+    default: "34603702-69ee-48e8-89b9-f3eb106724e8,746f1729-3057-4ff7-b0b8-b86e64f6f7e1"
+
+  - name: deployMode
+    displayName: "Deploy Mode"
+    type: string
+    default: "full"
+    values:
+      - full
+      - connections-only
+ 
+  
+variables:
+  pythonVersion: "3.11"
+  fabricCicdVersion: "latest"
+  msFabricCliVersion: "latest"
+  repositoryDirectory: "$(Build.SourcesDirectory)"  # Root of repo
+
+stages:
+  # Stage 1: Capture Artifact IDs from Dev Workspace
+  - stage: Capture_Artifact_IDs
+    displayName: "Capture Artifact IDs"
+    condition: eq('${{ parameters.deployMode }}', 'full')
+    jobs:
+      - job: CaptureIds
+        displayName: "Capture Artifact Metadata"
+        pool:
+          vmImage: "windows-latest"
+        steps:
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ variables.pythonVersion }}"
+            inputs:
+              versionSpec: "${{ variables.pythonVersion }}"
+
+          - task: AzureCLI@2
+            displayName: "Install Fabric CLI & Authenticate"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "pscore"
+              scriptLocation: "scriptPath"
+              scriptPath: "$(Build.SourcesDirectory)/.deploy/install_fab_cli.ps1"
+              arguments: '-FabricCliVersion "${{ variables.msFabricCliVersion }}"'
+              addSpnToEnvironment: true
+
+          - task: AzureCLI@2
+            displayName: "Capture Artifact IDs"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "pscore"
+              scriptLocation: "scriptPath"
+              scriptPath: "$(Build.SourcesDirectory)/.deploy/capture_artifact_ids.ps1"
+              arguments: >-
+                -WorkspaceName "${{ parameters.devWorkspaceName }}"
+                -OutputPath "$(Build.ArtifactStagingDirectory)/artifact_mapping.json"
+                -UpdateParameterYml
+                -ParameterYmlPath "$(Build.SourcesDirectory)/parameter.yml"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Artifact Mapping"
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/artifact_mapping.json'
+              artifactName: 'artifact_mapping'
+              publishLocation: 'pipeline'
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Parameter YAML"
+            inputs:
+              targetPath: '$(Build.SourcesDirectory)/parameter.yml'
+              artifactName: 'parameter_yml'
+              publishLocation: 'pipeline'
+
+  # Stage 2: Deploy All Artifacts
+  - stage: Deploy_All_Artifacts
+    displayName: "Deploy All Artifacts"
+    dependsOn: Capture_Artifact_IDs
+    condition: eq('${{ parameters.deployMode }}', 'full')
+    jobs:
+      - job: DeployAll
+        displayName: "Deploy All Artifacts"
+        pool:
+          vmImage: "windows-latest"
+        steps:
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ variables.pythonVersion }}"
+            inputs:
+              versionSpec: "${{ variables.pythonVersion }}"
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Parameter YAML"
+            inputs:
+              artifactName: "parameter_yml"
+              targetPath: '$(Build.SourcesDirectory)'
+
+          - task: AzureCLI@2
+            displayName: "Install Dependencies & Deploy All Artifacts"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                set -e
+
+                echo "Installing fabric-cicd..."
+                pip install fabric-cicd==${{ variables.fabricCicdVersion }} || pip install fabric-cicd
+
+                echo "Deploying all artifacts..."
+                python .deploy/deploy_fabric.py \
+                  --workspace-id "${{ parameters.targetWorkspaceId }}" \
+                  --environment "${{ parameters.environment }}"
+            env:
+              FABRIC_WORKSPACE_ID: ${{ parameters.targetWorkspaceId }}
+              FABRIC_ENVIRONMENT: ${{ parameters.environment }}
+
+  # Stage 3: Initialize Data (run notebook)
+  - stage: Initialize_Data
+    displayName: "Initialize Data"
+    dependsOn: Deploy_All_Artifacts
+    condition: eq('${{ parameters.deployMode }}', 'full')
+    jobs:
+      - job: RunNotebook
+        displayName: "Run Initialization Notebook"
+        pool:
+          vmImage: "windows-latest"
+        steps:
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ variables.pythonVersion }}"
+            inputs:
+              versionSpec: "${{ variables.pythonVersion }}"
+
+          - task: AzureCLI@2
+            displayName: "Install Fabric CLI & Authenticate"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "pscore"
+              scriptLocation: "scriptPath"
+              scriptPath: "$(Build.SourcesDirectory)/.deploy/install_fab_cli.ps1"
+              arguments: '-FabricCliVersion "${{ variables.msFabricCliVersion }}"'
+              addSpnToEnvironment: true
+
+          - task: AzureCLI@2
+            displayName: "Run Notebook"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "pscore"
+              scriptLocation: "scriptPath"
+              scriptPath: "$(Build.SourcesDirectory)/.deploy/run_notebook.ps1"
+              arguments: >-
+                -WorkspaceName "${{ parameters.uatWorkspaceName }}"
+                -NotebookName "${{ parameters.initNotebookName }}"
+
+  # Stage 4: Create Semantic Model Connections
+  - stage: Create_SM_Connections
+    displayName: "Create SM Connections"
+    dependsOn: Initialize_Data
+    condition: not(failed())
+    jobs:
+      - job: CreateConnections
+        displayName: "Create Semantic Model Connections"
+        pool:
+          vmImage: "windows-latest"
+        steps:
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ variables.pythonVersion }}"
+            inputs:
+              versionSpec: "${{ variables.pythonVersion }}"
+
+          - task: AzureCLI@2
+            displayName: "Install Fabric CLI & Authenticate"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "pscore"
+              scriptLocation: "scriptPath"
+              scriptPath: "$(Build.SourcesDirectory)/.deploy/install_fab_cli.ps1"
+              arguments: '-FabricCliVersion "${{ variables.msFabricCliVersion }}"'
+              addSpnToEnvironment: true
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Parameter YAML"
+            condition: eq('${{ parameters.deployMode }}', 'full')
+            inputs:
+              artifactName: "parameter_yml"
+              targetPath: '$(Build.SourcesDirectory)'
+
+          - task: AzureCLI@2
+            displayName: "Create Connections & Update Parameter YAML"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "pscore"
+              scriptLocation: "scriptPath"
+              scriptPath: "$(Build.SourcesDirectory)/.deploy/create_sm_connections_stage.ps1"
+              arguments: >-
+                -TargetWorkspaceName "${{ parameters.uatWorkspaceName }}"
+                -ConnectionMappingPath "$(Build.SourcesDirectory)/connection_mapping.json"
+                -GroupId "${{ parameters.groupId }}"
+                -UserIds "${{ parameters.userIds }}"
+                -ParameterYmlPath "$(Build.SourcesDirectory)/parameter.yml"
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish Updated Parameter YAML"
+            inputs:
+              targetPath: '$(Build.SourcesDirectory)/parameter.yml'
+              artifactName: 'parameter_yml_with_bindings'
+              publishLocation: 'pipeline'
+
+  # Stage 5: Deploy Semantic Models
+  - stage: Deploy_Semantic_Models
+    displayName: "Deploy Semantic Models"
+    dependsOn: Create_SM_Connections
+    condition: not(failed())
+    jobs:
+      - job: DeploySM
+        displayName: "Deploy Semantic Models"
+        pool:
+          vmImage: "windows-latest"
+        steps:
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ variables.pythonVersion }}"
+            inputs:
+              versionSpec: "${{ variables.pythonVersion }}"
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Updated Parameter YAML"
+            inputs:
+              artifactName: "parameter_yml_with_bindings"
+              targetPath: '$(Build.SourcesDirectory)'
+
+          - task: AzureCLI@2
+            displayName: "Install Dependencies & Deploy Semantic Models"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                set -e
+
+                echo "Installing fabric-cicd..."
+                pip install fabric-cicd==${{ variables.fabricCicdVersion }} || pip install fabric-cicd
+
+                echo "Deploying semantic models..."
+                python .deploy/deploy_fabric.py \
+                  --workspace-id "${{ parameters.targetWorkspaceId }}" \
+                  --environment "${{ parameters.environment }}" \
+                  --items SemanticModel
+            env:
+              FABRIC_WORKSPACE_ID: ${{ parameters.targetWorkspaceId }}
+              FABRIC_ENVIRONMENT: ${{ parameters.environment }}
