@@ -594,7 +594,7 @@ Defines the pipeline stages, their order, conditions, and parameters. Key design
 ## 8. Repository Structure
 
 ```
-conn_mgmt/
+fabric_workspace_root_directory/
 │
 ├── azure-pipelines.yml              # Pipeline definition (all 5 stages)
 ├── connection_mapping.json          # Defines SM → Lakehouse connection mappings
@@ -609,11 +609,11 @@ conn_mgmt/
 │   └── create_sm_connection.ps1    # Stage 4 functions: Get-LakehouseSqlEndpoint,
 │                                   #   New-FabricConnection, Grant-FabricConnectionAccess
 │
-├── conn_mgmt_lh.Lakehouse/          # Lakehouse artifact definition
-├── conn_mgmt_sm.SemanticModel/      # Semantic Model artifact definition
-├── conn_mgmt_nb.Notebook/           # Notebook artifact definition
-├── conn_mgmt_rp.Report/             # Report artifact definition
-└── conn_mgmt_df.Dataflow/           # Dataflow artifact definition
+├── my_lakehouse.Lakehouse/          # Lakehouse artifact definition
+├── my_semantic_model.SemanticModel/      # Semantic Model artifact definition
+├── my_notebook.Notebook/           # Notebook artifact definition
+├── my_report.Report/             # Report artifact definition
+└── my_dataflow.Dataflow/           # Dataflow artifact definition
 ```
 
 > Fabric artifact folders follow the naming convention `<name>.<Type>/`. The `fabric-cicd` library uses this convention to discover and deploy items.
@@ -621,6 +621,13 @@ conn_mgmt/
 ---
 
 ## 9. How to Run
+
+### Add devops artifacts
+1. In your Fabric git repository, add the files in .deploy, azure-pipelines.yml, connection_mapping.json, and parameter.yml, as shown in step 8. 
+2. Create a new Azure DevOps pipeline using azure-pipelines.yml
+3. Configure service-connection as an input variable to the Azure DevOps pipeline
+
+
 
 ### Run the Full Pipeline
 
