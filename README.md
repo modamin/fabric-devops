@@ -58,21 +58,21 @@ This pipeline handles both problems fully automatically in a 5-stage orchestrati
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        Azure DevOps Pipeline                            │
 │                                                                         │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐              │
-│  │  Stage 1     │    │  Stage 2     │    │  Stage 3     │              │
-│  │  Capture     │───▶│  Deploy All  │───▶│  Initialize  │              │
-│  │  Artifact IDs│    │  Artifacts   │    │  Data        │              │
-│  └──────────────┘    └──────────────┘    └──────┬───────┘              │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐               │
+│  │  Stage 1     │    │  Stage 2     │    │  Stage 3     │               │
+│  │  Capture     │──▶ |  Deploy All  │──▶│  Initialize  │               |
+│  │  Artifact IDs│    │  Artifacts   │    │  Data        │               │
+│  └──────────────┘    └──────────────┘    └──────┬───────┘               │
+│                                                 │                       │
+│                         ┌───────────────────────▼──────────────┐        │
+│                         │  Stage 4: Create SM Connections      │        │
+│                         │  (Create SQL connections in UAT/PROD)│        │
+│                         └────────────────────────┬─────────────┘        │
 │                                                  │                      │
-│                         ┌────────────────────────▼─────────────┐       │
-│                         │  Stage 4: Create SM Connections       │       │
-│                         │  (Create SQL connections in UAT/PROD) │       │
-│                         └────────────────────────┬─────────────┘       │
-│                                                  │                      │
-│                         ┌────────────────────────▼─────────────┐       │
-│                         │  Stage 5: Deploy Semantic Models      │       │
-│                         │  (With connection bindings applied)   │       │
-│                         └──────────────────────────────────────┘       │
+│                         ┌────────────────────────▼─────────────┐        │
+│                         │  Stage 5: Deploy Semantic Models     │        │
+│                         │  (With connection bindings applied)  │        │
+│                         └──────────────────────────────────────┘        │
 └─────────────────────────────────────────────────────────────────────────┘
 
     DEV Workspace                           UAT / PROD Workspace
