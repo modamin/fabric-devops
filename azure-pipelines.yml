@@ -11,33 +11,33 @@ parameters:
   - name: targetWorkspaceId
     displayName: "Target Fabric Workspace ID"
     type: string
-    default: "f37cedbf-e37a-42e6-822f-b75b93cc8118"
+    default: "<target_workspace_id>"
   
   - name: devWorkspaceName
     displayName: "Fabric Dev Workspace Name (for artifact capture)"
     type: string
-    default: "cicd-conn-mgmt-dev"
+    default: "<dev_workspace_name>"
   
   - name: uatWorkspaceName
     displayName: "Fabric UAT Workspace Name"
     type: string
-    default: "cicd-conn-mgmt-uat"
+    default: "<uat_workspace_name>"
   
   
   - name: groupId
     displayName: "AAD Group ID to Grant Access"
     type: string
-    default: "bd9da7e3-1acd-476b-9159-3674a310f890"
+    default: "<group_object_id>"
 
   - name: initNotebookName
     displayName: "Notebook Name to Run for Initialization"
     type: string
-    default: "conn_mgmt_init_nb"
+    default: "<notebook_name>"
 
   - name: userIds
     displayName: "User Object IDs (comma-separated) to Grant Access"
     type: string
-    default: "34603702-69ee-48e8-89b9-f3eb106724e8,746f1729-3057-4ff7-b0b8-b86e64f6f7e1"
+    default: "<user_object_id_1>,<user_object_id_2>"
 
   - name: deployMode
     displayName: "Deploy Mode"

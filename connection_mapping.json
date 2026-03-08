@@ -1,7 +1,8 @@
 [
   {
-    "connection_name": "my-connection-1939",
-    "semantic_model_name": "conn_mgmt_sm",
-    "lakehouse_name": "conn_mgmt_lh"
+    "connection_name": "<new_connection_name>",
+    "semantic_model_name": "<semantic_model_name>",
+    "lakehouse_name": "<direct_lake_lakehouse_name>"
   }
 ]
+
