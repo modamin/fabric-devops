@@ -64,6 +64,12 @@ def parse_args():
         default=os.getenv("FABRIC_ENVIRONMENT", "UAT"),
         help="Target environment name (or set FABRIC_ENVIRONMENT env var)",
     )
+    parser.add_argument(
+        "--project",
+        dest="project",
+        required=True,
+        help="Project folder name to deploy (folder-level include).",
+    )
     return parser.parse_args()
 
 
@@ -82,11 +88,12 @@ def main():
     print(f"Item Types: {item_type_in_scope}")
     print(f"Workspace ID: {args.workspace_id}")
     print(f"Environment: {args.environment}")
+    print(f"Project: {args.project}")
 
     # Use Azure CLI credential to authenticate
     token_credential = AzureCliCredential()
 
-    append_feature_flag("enable_exclude_folder")
+    append_feature_flag("enable_include_folder")
     append_feature_flag("enable_lakehouse_unpublish")
     append_feature_flag("enable_experimental_features")
 
@@ -99,10 +106,11 @@ def main():
         token_credential=token_credential,
     )
 
-    # Publish all items defined in item_type_in_scope
+    # Publish only items within the project's folder
+    print(f"Deploying project: {args.project} (folder: /{args.project})")
     publish_all_items(
         fabric_workspace_obj=target_workspace,
-        folder_path_exclude_regex="EXCLUDE.*"
+        folder_path_to_include=[f"/{args.project}"],
     )
 
     # Unpublish all items defined in item_type_in_scope not found in repository

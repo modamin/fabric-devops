@@ -232,3 +232,4 @@ if ($UpdateParameterYml) {
 }
 
 Write-Host "Artifact capture completed successfully."
+exit 0

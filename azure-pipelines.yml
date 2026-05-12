@@ -1,43 +1,27 @@
-parameters:
-  - name: environment
-    displayName: "Target Environment"
-    type: string
-    default: "UAT"
-    values:
-      - DEV
-      - UAT
-      - PROD
+# =============================================================================
+# Trunk-Based Deployment Pipeline
+# =============================================================================
+# Branching model (Option 4):
+#   - main                    → synced to dev workspace via "Update from GIT" (no pipeline runs)
+#   - uat/<project>/x.y      → deployed to uat workspace via fabric-cicd (project folder only)
+#   - prod/<project>/x.y     → deployed to prod workspace via fabric-cicd (project folder only)
+#
+# Pipeline is manually triggered. Environment and project are auto-detected from branch name.
+# Workspace configuration is loaded from Azure DevOps variable groups:
+#   - fabric-uat   (for uat/* branches) — must define: targetWorkspaceId, targetWorkspaceName
+#   - fabric-prod  (for prod/* branches) — must define: targetWorkspaceId, targetWorkspaceName
+# =============================================================================
 
-  - name: targetWorkspaceId
-    displayName: "Target Fabric Workspace ID"
-    type: string
-    default: "<target_workspace_id>"
-  
+parameters:
   - name: devWorkspaceName
     displayName: "Fabric Dev Workspace Name (for artifact capture)"
     type: string
-    default: "<dev_workspace_name>"
-  
-  - name: uatWorkspaceName
-    displayName: "Fabric UAT Workspace Name"
-    type: string
-    default: "<uat_workspace_name>"
-  
-  
-  - name: groupId
-    displayName: "AAD Group ID to Grant Access"
-    type: string
-    default: "<group_object_id>"
+    default: "cicd-conn-mgmt-dev"
 
   - name: initNotebookName
     displayName: "Notebook Name to Run for Initialization"
     type: string
-    default: "<notebook_name>"
-
-  - name: userIds
-    displayName: "User Object IDs (comma-separated) to Grant Access"
-    type: string
-    default: "<user_object_id_1>,<user_object_id_2>"
+    default: "conn_mgmt_init_nb"
 
   - name: deployMode
     displayName: "Deploy Mode"
@@ -46,18 +30,88 @@ parameters:
     values:
       - full
       - connections-only
- 
-  
+
 variables:
-  pythonVersion: "3.11"
-  fabricCicdVersion: "latest"
-  msFabricCliVersion: "latest"
-  repositoryDirectory: "$(Build.SourcesDirectory)"  # Root of repo
+  - name: pythonVersion
+    value: "3.11"
+  - name: fabricCicdVersion
+    value: "latest"
+  - name: msFabricCliVersion
+    value: "latest"
+  - name: repositoryDirectory
+    value: "$(Build.SourcesDirectory)"
+
+  # --- Branch-based environment detection ---
+  - ${{ if startsWith(variables['Build.SourceBranch'], 'refs/heads/uat/') }}:
+    - name: environment
+      value: "UAT"
+    - name: environmentLower
+      value: "uat"
+    - group: fabric-uat
+  - ${{ elseif startsWith(variables['Build.SourceBranch'], 'refs/heads/prod/') }}:
+    - name: environment
+      value: "PROD"
+    - name: environmentLower
+      value: "prod"
+    - group: fabric-prod
+  - ${{ else }}:
+    - name: environment
+      value: ""
+    - name: environmentLower
+      value: ""
 
 stages:
+  # Stage 0: Validate Branch
+  - stage: Validate_Branch
+    displayName: "Validate Branch"
+    jobs:
+      - job: ValidateBranch
+        displayName: "Validate Branch & Environment"
+        pool:
+          vmImage: "windows-latest"
+        steps:
+          - checkout: none
+          - bash: |
+              echo "##[section]Branch Validation"
+              echo "Source Branch: $(Build.SourceBranch)"
+              echo "Detected Environment: $(environment)"
+              echo "Target Workspace ID: $(targetWorkspaceId)"
+              echo "Target Workspace Name: $(targetWorkspaceName)"
+
+              # Extract project name from branch: uat/<project>/<version> or prod/<project>/<version>
+              BRANCH="$(Build.SourceBranch)"
+              BRANCH_NAME="${BRANCH#refs/heads/}"
+              PROJECT_NAME=$(echo "$BRANCH_NAME" | cut -d'/' -f2)
+              echo "Detected Project: $PROJECT_NAME"
+              echo "##vso[task.setvariable variable=projectName;isOutput=true]$PROJECT_NAME"
+            name: detectConfig
+            displayName: "Detect Configuration & Project"
+
+          - bash: |
+              if [ -z "$(environment)" ]; then
+                echo "##[error]Pipeline must be run from a uat/* or prod/* branch."
+                echo "##[error]Branch '$(Build.SourceBranch)' is not a valid release branch."
+                echo "##[error]The main branch is synced to dev via 'Update from GIT' — no pipeline deployment needed."
+                exit 1
+              fi
+
+              # Validate branch has project name segment: env/project/version
+              BRANCH="$(Build.SourceBranch)"
+              BRANCH_NAME="${BRANCH#refs/heads/}"
+              SEGMENT_COUNT=$(echo "$BRANCH_NAME" | awk -F'/' '{print NF}')
+              if [ "$SEGMENT_COUNT" -lt 3 ]; then
+                echo "##[error]Branch must follow format: uat/<project_name>/<version> or prod/<project_name>/<version>"
+                echo "##[error]Got: $BRANCH_NAME"
+                exit 1
+              fi
+
+              echo "##[section]Environment '$(environment)' detected from branch '$(Build.SourceBranch)'"
+            displayName: "Validate Branch Name"
+
   # Stage 1: Capture Artifact IDs from Dev Workspace
   - stage: Capture_Artifact_IDs
     displayName: "Capture Artifact IDs"
+    dependsOn: Validate_Branch
     condition: eq('${{ parameters.deployMode }}', 'full')
     jobs:
       - job: CaptureIds
@@ -110,8 +164,12 @@ stages:
   # Stage 2: Deploy All Artifacts
   - stage: Deploy_All_Artifacts
     displayName: "Deploy All Artifacts"
-    dependsOn: Capture_Artifact_IDs
+    dependsOn:
+      - Validate_Branch
+      - Capture_Artifact_IDs
     condition: eq('${{ parameters.deployMode }}', 'full')
+    variables:
+      projectName: $[ stageDependencies.Validate_Branch.ValidateBranch.outputs['detectConfig.projectName'] ]
     jobs:
       - job: DeployAll
         displayName: "Deploy All Artifacts"
@@ -141,13 +199,14 @@ stages:
                 echo "Installing fabric-cicd..."
                 pip install fabric-cicd==${{ variables.fabricCicdVersion }} || pip install fabric-cicd
 
-                echo "Deploying all artifacts..."
+                echo "Deploying artifacts for project: $(projectName)"
                 python .deploy/deploy_fabric.py \
-                  --workspace-id "${{ parameters.targetWorkspaceId }}" \
-                  --environment "${{ parameters.environment }}"
+                  --workspace-id "$(targetWorkspaceId)" \
+                  --environment "$(environment)" \
+                  --project "$(projectName)"
             env:
-              FABRIC_WORKSPACE_ID: ${{ parameters.targetWorkspaceId }}
-              FABRIC_ENVIRONMENT: ${{ parameters.environment }}
+              FABRIC_WORKSPACE_ID: $(targetWorkspaceId)
+              FABRIC_ENVIRONMENT: $(environment)
 
   # Stage 3: Initialize Data (run notebook)
   - stage: Initialize_Data
@@ -183,7 +242,7 @@ stages:
               scriptLocation: "scriptPath"
               scriptPath: "$(Build.SourcesDirectory)/.deploy/run_notebook.ps1"
               arguments: >-
-                -WorkspaceName "${{ parameters.uatWorkspaceName }}"
+                -WorkspaceName "$(targetWorkspaceName)"
                 -NotebookName "${{ parameters.initNotebookName }}"
 
   # Stage 4: Create Semantic Model Connections
@@ -227,10 +286,10 @@ stages:
               scriptLocation: "scriptPath"
               scriptPath: "$(Build.SourcesDirectory)/.deploy/create_sm_connections_stage.ps1"
               arguments: >-
-                -TargetWorkspaceName "${{ parameters.uatWorkspaceName }}"
-                -ConnectionMappingPath "$(Build.SourcesDirectory)/connection_mapping.json"
-                -GroupId "${{ parameters.groupId }}"
-                -UserIds "${{ parameters.userIds }}"
+                -TargetWorkspaceName "$(targetWorkspaceName)"
+                -ConnectionMappingPath "$(Build.SourcesDirectory)/connection_mapping.$(environmentLower).json"
+                -GroupId "$(groupId)"
+                -UserIds "$(userIds)"
                 -ParameterYmlPath "$(Build.SourcesDirectory)/parameter.yml"
 
           - task: PublishPipelineArtifact@1
@@ -243,8 +302,12 @@ stages:
   # Stage 5: Deploy Semantic Models
   - stage: Deploy_Semantic_Models
     displayName: "Deploy Semantic Models"
-    dependsOn: Create_SM_Connections
+    dependsOn:
+      - Validate_Branch
+      - Create_SM_Connections
     condition: not(failed())
+    variables:
+      projectName: $[ stageDependencies.Validate_Branch.ValidateBranch.outputs['detectConfig.projectName'] ]
     jobs:
       - job: DeploySM
         displayName: "Deploy Semantic Models"
@@ -274,11 +337,12 @@ stages:
                 echo "Installing fabric-cicd..."
                 pip install fabric-cicd==${{ variables.fabricCicdVersion }} || pip install fabric-cicd
 
-                echo "Deploying semantic models..."
+                echo "Deploying semantic models for project: $(projectName)"
                 python .deploy/deploy_fabric.py \
-                  --workspace-id "${{ parameters.targetWorkspaceId }}" \
-                  --environment "${{ parameters.environment }}" \
+                  --workspace-id "$(targetWorkspaceId)" \
+                  --environment "$(environment)" \
+                  --project "$(projectName)" \
                   --items SemanticModel
             env:
-              FABRIC_WORKSPACE_ID: ${{ parameters.targetWorkspaceId }}
-              FABRIC_ENVIRONMENT: ${{ parameters.environment }}
+              FABRIC_WORKSPACE_ID: $(targetWorkspaceId)
+              FABRIC_ENVIRONMENT: $(environment)

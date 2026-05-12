@@ -1,8 +1,0 @@
-[
-  {
-    "connection_name": "<new_connection_name>",
-    "semantic_model_name": "<semantic_model_name>",
-    "lakehouse_name": "<direct_lake_lakehouse_name>"
-  }
-]
-

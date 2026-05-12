@@ -1,31 +1,98 @@
 # Fabric Connection Management — CI/CD Pipeline
 
-> **Purpose:** This document explains the end-to-end DevOps automation that deploys Microsoft Fabric workspaces across environments (DEV → UAT → PROD), solves the ID-remapping problem, and automatically creates and binds SQL connections for Semantic Models.
+> **Purpose:** This document explains the end-to-end DevOps automation that deploys Microsoft Fabric workspaces across environments (DEV → UAT → PROD) using a trunk-based branching model with project-based folder filtering, solves the ID-remapping problem, and automatically creates and binds SQL connections for Semantic Models.
 
 ---
 
 ## Table of Contents
 
-1. [The Problem This Solves](#1-the-problem-this-solves)
-2. [High-Level Architecture](#2-high-level-architecture)
-3. [Tools & Libraries](#3-tools--libraries)
-4. [Authentication](#4-authentication)
-5. [Pipeline Overview](#5-pipeline-overview)
-6. [Stage-by-Stage Walkthrough](#6-stage-by-stage-walkthrough)
-7. [Key Configuration Files](#7-key-configuration-files)
-8. [Repository Structure](#8-repository-structure)
-9. [How to Run](#9-how-to-run)
-10. [Prerequisites](#10-prerequisites)
+1. [Branching Model](#1-branching-model)
+2. [The Problem This Solves](#2-the-problem-this-solves)
+3. [High-Level Architecture](#3-high-level-architecture)
+4. [Tools & Libraries](#4-tools--libraries)
+5. [Authentication](#5-authentication)
+6. [Pipeline Overview](#6-pipeline-overview)
+7. [Stage-by-Stage Walkthrough](#7-stage-by-stage-walkthrough)
+8. [Key Configuration Files](#8-key-configuration-files)
+9. [Repository Structure](#9-repository-structure)
+10. [How to Run](#10-how-to-run)
+11. [Prerequisites](#11-prerequisites)
 
 ---
 
-## 1. The Problem This Solves
+## 1. Branching Model
+
+This repository follows **trunk-based development (Option 4)** for Fabric CI/CD with **project-based folder filtering**.
+
+### Branch Strategy
+
+| Branch | Purpose | Deployment |
+|--------|---------|------------|
+| `main` | Integration branch | Synced to **dev** workspace via **Update from GIT** (no pipeline runs) |
+| `uat/<project>/x.y` | Release candidate | Deploys only `<project>` folder to **UAT** workspace via `fabric-cicd` |
+| `prod/<project>/x.y` | Production release | Deploys only `<project>` folder to **PROD** workspace via `fabric-cicd` |
+
+### Release Workflow
+
+```
+main (dev workspace — synced via "Update from GIT")
+  │
+  ├── Create Branch ──▶ uat/conn_mgmt/1.0 ──▶ fabric-cicd ──▶ UAT workspace (conn_mgmt folder only)
+  │                          │
+  │                     Create Branch ──▶ prod/conn_mgmt/1.0 ──▶ fabric-cicd ──▶ Prod workspace
+  │
+  ├── Create Branch ──▶ uat/conn_mgmt/1.1 ──▶ fabric-cicd ──▶ UAT workspace (conn_mgmt folder only)
+  │                          │
+  │                     Create Branch ──▶ prod/conn_mgmt/1.1 ──▶ fabric-cicd ──▶ Prod workspace
+  │
+  ├── Create Branch ──▶ uat/other_project/1.0 ──▶ fabric-cicd ──▶ UAT workspace (other_project folder only)
+  │
+  └── ...
+```
+
+### Project-Based Filtering
+
+The branch name encodes which project to deploy:
+
+```
+uat/<project_name>/<version>
+     └─────┬─────┘
+           │
+           ▼
+  folder_path_to_include = ["/<project_name>"]
+```
+
+- The pipeline extracts `<project_name>` from the branch (2nd segment)
+- Only items inside the `/<project_name>/` workspace folder are deployed
+- Items in other folders or at the root are **not** deployed
+- This allows multiple teams/projects to share a single repository and workspace
+
+### Release History
+
+| UAT Branches | Prod Branches |
+|--------------|---------------|
+| `uat/conn_mgmt/1.0` | `prod/conn_mgmt/1.0` |
+| `uat/conn_mgmt/1.1` | `prod/conn_mgmt/1.1` |
+| `uat/other_project/1.0` | `prod/other_project/1.0` |
+
+### Key Principles
+
+- **No long-lived branches** for UAT and PROD — each release creates new short-lived branches
+- **main** is always the source of truth — developers commit to main, which syncs to the dev workspace
+- **Environment is auto-detected** from the branch prefix (`uat/*` or `prod/*`)
+- **Project is auto-detected** from the branch name (2nd segment)
+- **Pipeline rejects runs from main** — the dev workspace is managed entirely via "Update from GIT"
+- **Branch must have 3 segments** — `env/project/version` format is validated
+
+---
+
+## 2. The Problem This Solves
 
 Deploying Microsoft Fabric workspaces across environments introduces two hard challenges:
 
 ### Challenge 1: IDs change between environments
 
-Every Fabric artifact (Lakehouse, Semantic Model, Notebook, etc.) has a unique GUID that is different in every workspace. When you deploy a Semantic Model from DEV to UAT, any hardcoded DEV GUIDs embedded inside the artifact definition (e.g., in a connection string, data source reference, or expression) will be wrong in UAT.
+Every Fabric artifact (Lakehouse, Semantic Model, Notebook, etc.) has a unique GUID that is different in every workspace. When you deploy a Semantic Model from DEV to UAT, any hardcoded DEV GUIDs embedded inside the artifact definition will be wrong in UAT.
 
 ```
 DEV Lakehouse ID:  f926c5dc-1362-4de5-9d37-ca29c1be3d98
@@ -34,69 +101,80 @@ UAT Lakehouse ID:  a91b3e12-7f40-48cc-b102-d4e8f3ac0021  ← different!
 
 ### Challenge 2: SQL Connections don't exist in the target environment
 
-Semantic Models that query a Lakehouse via SQL need a **Fabric Connection** object — a named, reusable connection that stores the SQL endpoint server/database and credentials. These connections:
+Semantic Models that query a Lakehouse via SQL need a **Fabric Connection** object. These connections:
 
 - Don't exist in a brand-new UAT/PROD workspace
 - Must be created **after** the Lakehouse is deployed (the SQL endpoint is only known post-deployment)
 - Must be **bound** to the Semantic Model before the model is deployed
 
+### Challenge 3: Multi-project repository
+
+Multiple projects share the same repository and workspace. Deploying everything on every release is wasteful and risky — you only want to deploy the items that belong to the project being released.
+
 ### The Solution
 
-This pipeline handles both problems fully automatically in a 5-stage orchestration:
+This pipeline handles all three problems fully automatically in a 5-stage orchestration:
 
 1. Capture all DEV artifact IDs → generate a substitution map (`parameter.yml`)
-2. Deploy all artifacts, substituting DEV IDs → UAT IDs on the fly
+2. Deploy only the project's folder items, substituting DEV IDs → UAT/PROD IDs on the fly
 3. Run the initialization notebook to seed data
-4. Create SQL connections pointing to UAT Lakehouse SQL endpoints
+4. Create SQL connections pointing to target Lakehouse SQL endpoints
 5. Redeploy Semantic Models with the new connection bindings applied
 
 ---
 
-## 2. High-Level Architecture
+## 3. High-Level Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        Azure DevOps Pipeline                            │
+│  Branch: uat/conn_mgmt/1.0 → env=UAT, project=conn_mgmt               │
 │                                                                         │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐               │
-│  │  Stage 1     │    │  Stage 2     │    │  Stage 3     │               │
-│  │  Capture     │──▶ |  Deploy All  │──▶│  Initialize  │               |
-│  │  Artifact IDs│    │  Artifacts   │    │  Data        │               │
-│  └──────────────┘    └──────────────┘    └──────┬───────┘               │
-│                                                 │                       │
-│                         ┌───────────────────────▼──────────────┐        │
-│                         │  Stage 4: Create SM Connections      │        │
-│                         │  (Create SQL connections in UAT/PROD)│        │
-│                         └────────────────────────┬─────────────┘        │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐              │
+│  │  Stage 1     │    │  Stage 2     │    │  Stage 3     │              │
+│  │  Capture     │───▶│  Deploy All  │───▶│  Initialize  │              │
+│  │  Artifact IDs│    │  (project    │    │  Data        │              │
+│  │              │    │   folder)    │    │              │              │
+│  └──────────────┘    └──────────────┘    └──────┬───────┘              │
 │                                                  │                      │
-│                         ┌────────────────────────▼─────────────┐        │
-│                         │  Stage 5: Deploy Semantic Models     │        │
-│                         │  (With connection bindings applied)  │        │
-│                         └──────────────────────────────────────┘        │
+│                         ┌────────────────────────▼─────────────┐       │
+│                         │  Stage 4: Create SM Connections       │       │
+│                         │  (Create SQL connections in target)   │       │
+│                         └────────────────────────┬─────────────┘       │
+│                                                  │                      │
+│                         ┌────────────────────────▼─────────────┐       │
+│                         │  Stage 5: Deploy Semantic Models      │       │
+│                         │  (project folder, with bindings)      │       │
+│                         └──────────────────────────────────────┘       │
 └─────────────────────────────────────────────────────────────────────────┘
 
     DEV Workspace                           UAT / PROD Workspace
 ┌─────────────────┐                     ┌─────────────────────────┐
-│  Lakehouse      │  Stage 1: read IDs  │  Lakehouse              │
-│  Semantic Model │─────────────────▶   │  Semantic Model         │
-│  Notebook       │  Stage 2: deploy ▶  │  Notebook               │
-│  Report         │                     │  Report                 │
-│  Dataflow       │                     │  Dataflow               │
-└─────────────────┘                     │  SQL Connection (new)   │
+│  /conn_mgmt/    │                     │  /conn_mgmt/            │
+│    Lakehouse    │  Stage 1: read IDs  │    Lakehouse            │
+│    Semantic M.  │─────────────────▶   │    Semantic Model       │
+│    Notebook     │  Stage 2: deploy ▶  │    Notebook             │
+│    Report       │  (folder only)      │    Report               │
+│    Dataflow     │                     │    Dataflow             │
+│                 │                     │    SQL Connection (new)  │
+│  /other_proj/   │                     │                         │
+│    ...          │  ← NOT deployed     │  /other_proj/           │
+└─────────────────┘                     │    (untouched)          │
                                         └─────────────────────────┘
 ```
 
 ---
 
-## 3. Tools & Libraries
-
-The pipeline uses four distinct tools, each serving a different purpose:
+## 4. Tools & Libraries
 
 ### `fabric-cicd` (Python library)
 **PyPI:** `fabric-cicd`
-**What it does:** Handles deploying Fabric workspace items (Lakehouses, Notebooks, Semantic Models, Reports, etc.) from a Git repository into a target workspace. It reads the item definitions stored in the repository and calls the Fabric REST API to create or update them.
+**What it does:** Deploys Fabric workspace items from a Git repository into a target workspace. Reads item definitions and calls the Fabric REST API to create or update them.
 
-**Key capability — parameterization:** `fabric-cicd` reads `parameter.yml` and performs find-and-replace on artifact content at deploy time, swapping DEV GUIDs for UAT GUIDs using dynamic token expressions like `$items.Lakehouse.conn_mgmt_lh.$id`.
+**Key capabilities:**
+- **Parameterization:** Reads `parameter.yml` and performs find-and-replace on artifact content at deploy time
+- **Folder-level include:** `folder_path_to_include` parameter deploys only items within specified workspace folders
+- **Semantic model binding:** Binds Semantic Models to SQL connections using the `semantic_model_binding` section in `parameter.yml`
 
 ```python
 from fabric_cicd import FabricWorkspace, publish_all_items, unpublish_all_orphan_items
@@ -109,156 +187,95 @@ target_workspace = FabricWorkspace(
     token_credential=token_credential,
 )
 
-publish_all_items(fabric_workspace_obj=target_workspace)
-unpublish_all_orphan_items(target_workspace)  # cleans up items removed from repo
+publish_all_items(
+    fabric_workspace_obj=target_workspace,
+    folder_path_to_include=["/conn_mgmt"],  # Only deploy this project's folder
+)
+unpublish_all_orphan_items(target_workspace)
 ```
 
 ---
 
 ### `ms-fabric-cli` (CLI tool — `fab`)
 **PyPI:** `ms-fabric-cli`
-**What it does:** A command-line tool that wraps the Fabric REST API, letting scripts interact with workspaces, lakehouses, notebooks, and connections using simple commands rather than raw HTTP calls.
+**What it does:** Wraps the Fabric REST API for scripted interactions with workspaces, lakehouses, notebooks, and connections.
 
-**Key commands used in this pipeline:**
+**Key commands used:**
 
 | Command | Purpose |
 |---------|---------|
 | `fab ls <workspace>.Workspace -l --output_format json` | List all items in a workspace |
-| `fab get <workspace>.Workspace/<item>.Lakehouse -q 'properties.sqlEndpointProperties.connectionString'` | Query the SQL endpoint of a Lakehouse |
-| `fab get <workspace>.Workspace -q 'id'` | Get a workspace's GUID |
-| `fab exists .connections/<name>.Connection` | Check if a connection already exists |
+| `fab get <workspace>.Workspace/<item>.Lakehouse -q 'properties.sqlEndpointProperties.connectionString'` | Query Lakehouse SQL endpoint |
+| `fab exists .connections/<name>.Connection` | Check if a connection exists |
 | `fab create .connections/<name>.Connection -P <params>` | Create a new connection |
-| `fab auth login -u <clientId> --federated-token <token> --tenant <tenantId>` | Authenticate using a federated token |
 | `fab api -X post connections/<id>/roleAssignments` | Grant access to a connection |
 
 ---
 
-### Fabric REST API (direct HTTP calls)
+### Fabric REST API (direct HTTP)
 **Base URL:** `https://api.fabric.microsoft.com/v1`
-**What it does:** Used directly (via `Invoke-WebRequest`) to trigger notebook runs and poll for completion — a capability not yet exposed in the Fabric CLI.
-
-```powershell
-# Trigger notebook run
-POST /v1/workspaces/{workspaceId}/items/{notebookId}/jobs/instances?jobType=RunNotebook
-
-# Poll job status (URL returned in Location header of the 202 response)
-GET <Location URL>
-```
+**Used for:** Triggering notebook runs and polling for completion (not yet exposed in Fabric CLI).
 
 ---
 
 ### Azure CLI (`az`)
-**What it does:** Used for authentication. The Azure DevOps service connection logs into Azure via the `AzureCLI@2` pipeline task, making an authenticated `az` session available to all scripts. Scripts then use this session to:
-
-- Get bearer tokens for the Fabric REST API (`az account get-access-token`)
-- Get tenant and client IDs to authenticate the Fabric CLI (`az account show`)
+**Used for:** Authentication — getting bearer tokens, tenant/client IDs for the Fabric CLI.
 
 ---
 
-## 4. Authentication
+## 5. Authentication
 
-Authentication is layered — each tool uses a different mechanism, all rooted in the same Azure DevOps service connection.
+All authentication flows from a single Azure DevOps service connection:
 
 ```
 Azure DevOps Service Connection (Service Principal)
         │
         ▼
-AzureCLI@2 task  ──────────────────────────────────────────────┐
-        │                                                       │
-        ▼                                                       │
-az login (automatic, via task)                                  │
-        │                                                       │
-        ├──▶  AzureCliCredential()  ──▶  fabric-cicd           │
-        │     (Python SDK)               calls Fabric REST API  │
-        │                                                       │
-        ├──▶  az account get-access-token  ──▶  Fabric REST API│
-        │     Bearer token                    (notebook trigger)│
-        │                                                       │
-        └──▶  az account show + $env:idToken                   │
-              Federated token  ──▶  fab auth login  ──▶  fab CLI│
-```
-
-### `fabric-cicd` Authentication
-
-Uses `AzureCliCredential` from the `azure-identity` Python SDK. This automatically picks up the `az` session established by the `AzureCLI@2` task — no explicit credentials needed in the script.
-
-```python
-from azure.identity import AzureCliCredential
-
-token_credential = AzureCliCredential()
-
-target_workspace = FabricWorkspace(
-    workspace_id=args.workspace_id,
-    token_credential=token_credential,   # ← uses the az session
-    ...
-)
-```
-
-### Fabric CLI Authentication
-
-Uses a **federated OIDC token** issued by Azure DevOps. The `AzureCLI@2` task exposes this token in the `$env:idToken` environment variable when `addSpnToEnvironment: true` is set.
-
-```powershell
-# install_fab_cli.ps1
-$tenantId = az account show --query tenantId -o tsv
-$clientId = az account show --query user.name -o tsv
-
-fab auth login -u $clientId --federated-token $env:idToken --tenant $tenantId
-```
-
-This approach is preferred over a client secret because:
-- No secrets need to be stored in pipeline variables
-- The token is short-lived and scoped to the pipeline run
-- Federated identity is the recommended pattern for Azure DevOps workload identity
-
-### Fabric REST API Authentication (Notebook runner)
-
-Acquires a bearer token scoped specifically to the Fabric API:
-
-```powershell
-# run_notebook.ps1
-$accessToken = az account get-access-token `
-    --resource "https://api.fabric.microsoft.com" `
-    --query accessToken -o tsv
-
-$headers = @{ "Authorization" = "Bearer $accessToken" }
-```
-
-### Connection Creation Credentials
-
-When creating a new SQL connection, the service principal's credentials are passed as connection parameters. These are stored as Azure DevOps secret variables and injected as environment variables:
-
-```powershell
-# create_sm_connection.ps1 (New-FabricConnection)
-$params = @(
-    "credentialDetails.type=ServicePrincipal",
-    "credentialDetails.tenantId=$env:FAB_TENANT_ID",
-    "credentialDetails.servicePrincipalClientId=$env:FAB_CLIENT_ID",
-    "credentialDetails.servicePrincipalSecret=$env:FAB_CLIENT_SECRET",
-    ...
-) -join ","
-
-fab create $connectionPath -P $params
+AzureCLI@2 task
+        │
+        ├──▶  AzureCliCredential()  ──▶  fabric-cicd
+        │
+        ├──▶  az account get-access-token  ──▶  Fabric REST API (notebook trigger)
+        │
+        └──▶  Federated token ($env:idToken)  ──▶  fab auth login  ──▶  fab CLI
 ```
 
 ---
 
-## 5. Pipeline Overview
+## 6. Pipeline Overview
 
-The pipeline is defined in [azure-pipelines.yml](azure-pipelines.yml) and triggered manually with parameters.
+The pipeline is defined in [azure-pipelines.yml](azure-pipelines.yml) and triggered manually.
+
+### Branch-to-Environment Mapping
+
+| Branch Pattern | Environment | Variable Group |
+|----------------|-------------|----------------|
+| `uat/<project>/*` | UAT | `fabric-uat` |
+| `prod/<project>/*` | PROD | `fabric-prod` |
+| `main` | *(rejected)* | — |
 
 ### Pipeline Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `environment` | Target environment: DEV, UAT, or PROD | `UAT` |
-| `workspaceId` | GUID of the target Fabric workspace | *(UAT workspace ID)* |
 | `devWorkspaceName` | Name of the DEV workspace to read IDs from | `cicd-conn-mgmt-dev` |
-| `uatWorkspaceName` | Name of the target workspace | `cicd-conn-mgmt-uat` |
-| `groupId` | AAD Group ID to grant Owner access on connections | *(group ID)* |
-| `userIds` | Comma-separated AAD User Object IDs for access grants | *(user IDs)* |
 | `initNotebookName` | Name of the notebook to run for data initialization | `conn_mgmt_init_nb` |
 | `deployMode` | `full` or `connections-only` | `full` |
+
+### Variable Groups (configured in Azure DevOps)
+
+Each environment requires a variable group with these variables:
+
+| Variable | Description |
+|----------|-------------|
+| `targetWorkspaceId` | GUID of the target Fabric workspace |
+| `targetWorkspaceName` | Display name of the target Fabric workspace |
+| `groupId` | AAD Group ID to grant Owner access on SQL connections |
+| `userIds` | Comma-separated AAD User Object IDs for connection access |
+| `azureServiceConnection` | Name of the Azure service connection |
+
+- **`fabric-uat`** — for `uat/*` branches
+- **`fabric-prod`** — for `prod/*` branches
 
 ### Deploy Modes
 
@@ -267,18 +284,21 @@ The pipeline is defined in [azure-pipelines.yml](azure-pipelines.yml) and trigge
 | `full` | All 5 stages | Full deployment — first time or after artifact changes |
 | `connections-only` | Stages 4 & 5 only | Recreate/repair connections without redeploying artifacts |
 
-### Azure DevOps Variables (set in pipeline settings, not in YAML)
-
-| Variable | Description |
-|----------|-------------|
-| `azureServiceConnection` | Name of the Azure service connection |
-| `FAB_CLIENT_ID` | Service principal app ID (for connection credentials) |
-| `FAB_CLIENT_SECRET` | Service principal secret *(secret variable)* |
-| `FAB_TENANT_ID` | Azure AD tenant ID |
-
 ---
 
-## 6. Stage-by-Stage Walkthrough
+## 7. Stage-by-Stage Walkthrough
+
+### Stage 0 — Validate Branch
+
+**Condition:** Always runs
+
+**What it does:**
+- Validates the branch follows the `uat/<project>/<version>` or `prod/<project>/<version>` format (3 segments minimum)
+- Extracts the project name from the 2nd segment
+- Sets the `projectName` output variable consumed by Stages 2 and 5
+- Rejects runs from `main` or any branch that doesn't match `uat/*` or `prod/*`
+
+---
 
 ### Stage 1 — Capture Artifact IDs
 
@@ -287,37 +307,7 @@ The pipeline is defined in [azure-pipelines.yml](azure-pipelines.yml) and trigge
 **Condition:** `deployMode == 'full'`
 
 **What it does:**
-
-The DEV workspace has all the "source of truth" artifact IDs. This stage reads them out and creates a substitution map so `fabric-cicd` can replace DEV IDs with target environment IDs at deploy time.
-
-**Process flow:**
-
-```
-1. fab ls <devWorkspace>.Workspace -l --output_format json
-        │
-        ▼
-2. Filter to data object types:
-   Lakehouse, Warehouse, Eventhouse, KQLDatabase,
-   MirroredDatabase, SQLDatabase
-        │
-        ▼
-3. For each Lakehouse:
-   fab get <workspace>/<name>.Lakehouse
-   → extract SQL endpoint: connectionString + id
-        │
-        ▼
-4. Write artifact_mapping.json (pipeline artifact)
-        │
-        ▼
-5. Build parameter.yml with find_replace entries:
-   DEV workspace ID   → $workspace.$id
-   DEV lakehouse ID   → $items.Lakehouse.<name>.$id
-   DEV SQL endpoint ID → $items.Lakehouse.<name>.$sqlendpointid
-   DEV SQL conn string → $items.Lakehouse.<name>.$sqlendpoint
-        │
-        ▼
-6. Publish parameter.yml as pipeline artifact
-```
+Reads DEV workspace artifact IDs and generates `parameter.yml` with find_replace entries for ID substitution.
 
 **Example generated `parameter.yml`:**
 
@@ -325,11 +315,11 @@ The DEV workspace has all the "source of truth" artifact IDs. This stage reads t
 find_replace:
   - find_value: e0a0c0d0-c9d9-4a7e-978d-6ac8e79af581      # DEV workspace ID
     replace_value:
-      _ALL_: $workspace.$id                                 # → UAT workspace ID
+      _ALL_: $workspace.$id
 
   - find_value: f926c5dc-1362-4de5-9d37-ca29c1be3d98       # DEV lakehouse ID
     replace_value:
-      _ALL_: $items.Lakehouse.conn_mgmt_lh.$id              # → UAT lakehouse ID
+      _ALL_: $items.Lakehouse.conn_mgmt_lh.$id
 
   - find_value: 5c6d4df6-6984-45c3-b51b-d979fdcc62d9       # DEV SQL endpoint ID
     replace_value:
@@ -340,56 +330,31 @@ find_replace:
       _ALL_: $items.Lakehouse.conn_mgmt_lh.$sqlendpoint
 ```
 
-> `_ALL_` means the substitution applies to all environments. `fabric-cicd` resolves the `$items.*` and `$workspace.*` tokens to the actual UAT/PROD values when deploying.
-
 ---
 
-### Stage 2 — Deploy All Artifacts
+### Stage 2 — Deploy All Artifacts (Project Folder Only)
 
 **Script:** [.deploy/deploy_fabric.py](.deploy/deploy_fabric.py)
 **Runs on:** Target workspace (UAT/PROD)
-**Condition:** `deployMode == 'full'`
-**Depends on:** Stage 1
+**Key feature:** `--project <name>` → `folder_path_to_include=["/name"]`
 
 **What it does:**
+Deploys only items within the project's workspace folder, substituting DEV IDs with target environment IDs.
 
-Downloads the `parameter.yml` artifact from Stage 1, then uses `fabric-cicd` to deploy every artifact type from the repository into the target workspace.
-
-**Process flow:**
-
+```bash
+python .deploy/deploy_fabric.py \
+  --workspace-id "$(targetWorkspaceId)" \
+  --environment "$(environment)" \
+  --project "$(projectName)"
 ```
-1. Download parameter.yml from Stage 1 pipeline artifact
-        │
-        ▼
-2. pip install fabric-cicd
-        │
-        ▼
-3. python .deploy/deploy_fabric.py
-   --workspace-id <UAT workspace ID>
-   --environment UAT
-        │
-        ▼
-4. fabric-cicd reads repo, reads parameter.yml
-   For each artifact in repo:
-     - Replace DEV IDs with UAT IDs (find_replace)
-     - Create or update the item in the target workspace
-        │
-        ▼
-5. unpublish_all_orphan_items()
-   Removes artifacts in the workspace that no longer exist in the repo
-```
-
-**Supported artifact types:**
-
-`Lakehouse`, `Warehouse`, `Eventhouse`, `KQLDatabase`, `MirroredDatabase`, `SQLDatabase`, `SemanticModel`, `Notebook`, `DataPipeline`, `Report`, `KQLQueryset`, `Environment`, `Reflex`, `Eventstream`, `CopyJob`, `VariableLibrary`, `Dataflow`
 
 **Feature flags enabled:**
 
 | Flag | Purpose |
 |------|---------|
-| `enable_exclude_folder` | Skips folders matching `EXCLUDE.*` pattern |
+| `enable_include_folder` | Enables `folder_path_to_include` filtering |
 | `enable_lakehouse_unpublish` | Allows lakehouses to be removed as orphans |
-| `enable_experimental_features` | Enables preview capabilities in `fabric-cicd` |
+| `enable_experimental_features` | Required for selective deployment features |
 
 ---
 
@@ -397,39 +362,8 @@ Downloads the `parameter.yml` artifact from Stage 1, then uses `fabric-cicd` to 
 
 **Script:** [.deploy/run_notebook.ps1](.deploy/run_notebook.ps1)
 **Runs on:** Target workspace (UAT/PROD)
-**Condition:** Previous stage did not fail
-**Depends on:** Stage 2
 
-**What it does:**
-
-Runs a Fabric Notebook in the target workspace to seed or initialize data (e.g., creating tables, loading reference data). This runs **after** deployment so the Lakehouse structure is in place.
-
-**Process flow:**
-
-```
-1. fab get <workspace>.Workspace -q 'id'
-   → resolve workspace GUID
-        │
-        ▼
-2. fab get <workspace>.Workspace/<notebook>.Notebook -q 'id'
-   → resolve notebook GUID
-        │
-        ▼
-3. az account get-access-token --resource https://api.fabric.microsoft.com
-   → acquire Bearer token
-        │
-        ▼
-4. POST /v1/workspaces/{workspaceId}/items/{notebookId}/jobs/instances?jobType=RunNotebook
-   → trigger async notebook run
-   → read Location header from 202 response
-        │
-        ▼
-5. Poll Location URL every 30 seconds (max 60 minutes)
-   until status is: Completed | Failed | Cancelled | Deduped
-        │
-        ▼
-6. Fail the pipeline stage if status ≠ Completed
-```
+Triggers a Fabric Notebook in the target workspace to seed or initialize data. Polls for completion (max 60 minutes).
 
 ---
 
@@ -437,105 +371,38 @@ Runs a Fabric Notebook in the target workspace to seed or initialize data (e.g.,
 
 **Scripts:** [.deploy/create_sm_connections_stage.ps1](.deploy/create_sm_connections_stage.ps1), [.deploy/create_sm_connection.ps1](.deploy/create_sm_connection.ps1)
 **Runs on:** Target workspace (UAT/PROD)
-**Condition:** Previous stage did not fail
-**Depends on:** Stage 3
 
 **What it does:**
-
-This is the most complex stage. Semantic Models that query a Lakehouse need a **Fabric SQL Connection** object — a persistent, reusable connection that stores the SQL server endpoint and credentials. Those connections can only be created after the Lakehouse exists in the target environment.
-
-**Process flow:**
-
-```
-1. Read connection_mapping.json
-   (defines: connection_name, semantic_model_name, lakehouse_name)
-        │
-        ▼
-2. For each entry in connection_mapping.json:
-        │
-        ├─ Get SQL endpoint from target workspace:
-        │    fab get <workspace>/<lakehouse>.Lakehouse
-        │    → connectionString (SQL server hostname)
-        │    → id (SQL database ID)
-        │
-        ├─ Check if connection already exists:
-        │    fab exists .connections/<name>.Connection
-        │
-        ├─ If not exists → create connection:
-        │    fab create .connections/<name>.Connection -P <params>
-        │    (type=SQL, ServicePrincipal credentials)
-        │
-        ├─ Grant Owner access to AAD Group:
-        │    fab api -X post connections/<id>/roleAssignments
-        │    { "principal": { "id": "<groupId>", "type": "Group" }, "role": "Owner" }
-        │
-        └─ Grant Owner access to individual Users (if specified):
-             fab api -X post connections/<id>/roleAssignments
-             { "principal": { "id": "<userId>", "type": "User" }, "role": "Owner" }
-        │
-        ▼
-3. Build semantic_model_binding entries:
-   [ { connection_id: "<id>", semantic_model_name: "conn_mgmt_sm" } ]
-        │
-        ▼
-4. Append semantic_model_binding to parameter.yml
-   (preserves existing find_replace entries)
-        │
-        ▼
-5. Publish updated parameter.yml as pipeline artifact 'parameter_yml_with_bindings'
-```
-
-**Example `parameter.yml` after Stage 4:**
-
-```yaml
-find_replace:
-  - find_value: f926c5dc-1362-4de5-9d37-ca29c1be3d98
-    replace_value:
-      _ALL_: $items.Lakehouse.conn_mgmt_lh.$id
-  # ... (other find_replace entries from Stage 1)
-
-semantic_model_binding:
-  - connection_id: 7a3c1f88-bd42-4e19-9cd1-0f8a2e3b5d71
-    semantic_model_name: conn_mgmt_sm
-```
-
-> The `semantic_model_binding` section tells `fabric-cicd` to bind the Semantic Model to the given connection ID when deploying it.
+1. Reads `connection_mapping.<env>.json` to find which connections are needed
+2. Queries target Lakehouse SQL endpoint
+3. Creates SQL connections (if they don't exist) using the service principal
+4. Grants Owner access to the AAD group and users (from variable group)
+5. Appends `semantic_model_binding` to `parameter.yml`
 
 ---
 
-### Stage 5 — Deploy Semantic Models
+### Stage 5 — Deploy Semantic Models (Project Folder Only)
 
 **Script:** [.deploy/deploy_fabric.py](.deploy/deploy_fabric.py) (with `--items SemanticModel`)
 **Runs on:** Target workspace (UAT/PROD)
-**Condition:** Previous stage did not fail
-**Depends on:** Stage 4
 
-**What it does:**
+Redeploys only Semantic Models within the project folder, using the updated `parameter.yml` that now includes connection bindings.
 
-Runs `deploy_fabric.py` a second time, but this time targeted only at Semantic Models and using the updated `parameter.yml` that now includes the `semantic_model_binding` section. This final deployment binds each Semantic Model to its SQL connection.
-
-```
-1. Download parameter_yml_with_bindings artifact
-        │
-        ▼
-2. python .deploy/deploy_fabric.py
-   --workspace-id <UAT workspace ID>
-   --environment UAT
-   --items SemanticModel
-        │
-        ▼
-3. fabric-cicd deploys Semantic Models
-   Uses semantic_model_binding from parameter.yml
-   to bind each model to its SQL connection
+```bash
+python .deploy/deploy_fabric.py \
+  --workspace-id "$(targetWorkspaceId)" \
+  --environment "$(environment)" \
+  --project "$(projectName)" \
+  --items SemanticModel
 ```
 
 ---
 
-## 7. Key Configuration Files
+## 8. Key Configuration Files
 
-### `connection_mapping.json`
+### `connection_mapping.uat.json` / `connection_mapping.prod.json`
 
-Defines which Semantic Models need SQL connections and which Lakehouses they connect to. Add one entry per Semantic Model that queries a Lakehouse via DirectLake or SQL.
+Environment-specific connection mapping files. The pipeline automatically selects the correct file based on the detected environment.
 
 ```json
 [
@@ -547,161 +414,108 @@ Defines which Semantic Models need SQL connections and which Lakehouses they con
 ]
 ```
 
-| Field | Description |
-|-------|-------------|
-| `connection_name` | The display name of the Fabric SQL Connection to create |
-| `semantic_model_name` | The Semantic Model to bind the connection to |
-| `lakehouse_name` | The Lakehouse whose SQL endpoint the connection points to |
-
-Multiple entries are supported — one per Semantic Model / Lakehouse pair.
-
----
-
 ### `parameter.yml`
 
 **Auto-generated by the pipeline — do not edit manually.**
 
-This file is built fresh in Stage 1 and extended in Stage 4. It drives all environment-specific substitutions inside `fabric-cicd`.
-
-**Two sections:**
-
-| Section | Set By | Purpose |
-|---------|--------|---------|
-| `find_replace` | Stage 1 | Replaces DEV GUIDs with UAT/PROD GUIDs in artifact definitions |
-| `semantic_model_binding` | Stage 4 | Binds each Semantic Model to its SQL connection ID |
-
-**Token syntax used in `find_replace`:**
-
-| Token | Resolves To |
-|-------|------------|
-| `$workspace.$id` | The target workspace's GUID |
-| `$items.Lakehouse.<name>.$id` | The target Lakehouse's GUID |
-| `$items.Lakehouse.<name>.$sqlendpointid` | The target Lakehouse's SQL endpoint GUID |
-| `$items.Lakehouse.<name>.$sqlendpoint` | The target Lakehouse's SQL server hostname |
-
----
+Built in Stage 1 (find_replace entries) and extended in Stage 4 (semantic_model_binding).
 
 ### `azure-pipelines.yml`
 
-Defines the pipeline stages, their order, conditions, and parameters. Key design decisions:
-
-- Each stage runs on a fresh `windows-latest` agent
-- Stages pass data to each other via **pipeline artifacts** (not environment variables), making them durable across agent boundaries
-- `deployMode: connections-only` skips Stages 1–3, jumping directly to connection creation and Semantic Model redeployment — useful for fixing connection issues without a full redeploy
+Defines the 6 pipeline stages (0–5), their order, conditions, and parameters.
 
 ---
 
-## 8. Repository Structure
+## 9. Repository Structure
 
 ```
-fabric_workspace_root_directory/
+conn_mgmt/
 │
-├── azure-pipelines.yml              # Pipeline definition (all 5 stages)
-├── connection_mapping.json          # Defines SM → Lakehouse connection mappings
-├── parameter.yml                    # Auto-generated by pipeline (do not edit)
+├── azure-pipelines.yml                # Pipeline definition (6 stages)
+├── connection_mapping.uat.json        # UAT: SM → Lakehouse connection mappings
+├── connection_mapping.prod.json       # Prod: SM → Lakehouse connection mappings
+├── connection_mapping.json            # Reference template (not used by pipeline)
+├── parameter.yml                      # Auto-generated by pipeline (do not edit)
 │
-├── .deploy/                         # All deployment automation scripts
-│   ├── capture_artifact_ids.ps1     # Stage 1: reads DEV IDs, generates parameter.yml
-│   ├── deploy_fabric.py             # Stages 2 & 5: deploys artifacts via fabric-cicd
-│   ├── install_fab_cli.ps1          # Installs ms-fabric-cli and authenticates
-│   ├── run_notebook.ps1             # Stage 3: triggers notebook and polls for completion
-│   ├── create_sm_connections_stage.ps1  # Stage 4 orchestrator: reads mapping, calls helpers
-│   └── create_sm_connection.ps1    # Stage 4 functions: Get-LakehouseSqlEndpoint,
-│                                   #   New-FabricConnection, Grant-FabricConnectionAccess
+├── .deploy/                           # All deployment automation scripts
+│   ├── capture_artifact_ids.ps1       # Stage 1: reads DEV IDs, generates parameter.yml
+│   ├── deploy_fabric.py              # Stages 2 & 5: deploys artifacts via fabric-cicd
+│   ├── install_fab_cli.ps1            # Installs ms-fabric-cli and authenticates
+│   ├── run_notebook.ps1               # Stage 3: triggers notebook and polls for completion
+│   ├── create_sm_connections_stage.ps1  # Stage 4 orchestrator
+│   └── create_sm_connection.ps1      # Stage 4 functions: connection creation & access
 │
-├── my_lakehouse.Lakehouse/          # Lakehouse artifact definition
-├── my_semantic_model.SemanticModel/      # Semantic Model artifact definition
-├── my_notebook.Notebook/           # Notebook artifact definition
-├── my_report.Report/             # Report artifact definition
-└── my_dataflow.Dataflow/           # Dataflow artifact definition
+├── conn_mgmt/                         # ← Project folder (items deployed by the pipeline)
+│   ├── conn_mgmt_lh.Lakehouse/
+│   ├── conn_mgmt_sm.SemanticModel/
+│   ├── conn_mgmt_nb.Notebook/
+│   ├── conn_mgmt_rp.Report/
+│   └── conn_mgmt_df.Dataflow/
+│
+└── EXCLUDE/                           # Items excluded from deployment
+    └── conn_mgmt_exclude_nb.Notebook/
 ```
 
-> Fabric artifact folders follow the naming convention `<name>.<Type>/`. The `fabric-cicd` library uses this convention to discover and deploy items.
+> Items must be inside a workspace folder (subfolder matching the project name) for `folder_path_to_include` to filter them. Items at the repo root are considered "standalone" and are not affected by folder-level filters.
 
 ---
 
-## 9. How to Run
+## 10. How to Run
 
-### Add devops artifacts
-1. In your Fabric git repository, add the files in .deploy, azure-pipelines.yml, connection_mapping.json, and parameter.yml, as shown in step 8. 
-2. Create a new Azure DevOps pipeline using azure-pipelines.yml
-3. Configure service-connection as an input variable to the Azure DevOps pipeline
+### Full Deployment
 
+1. Ensure items are inside the project folder (e.g., `conn_mgmt/conn_mgmt_sm.SemanticModel/`)
+2. Create a release branch: `uat/conn_mgmt/1.0` from `main`
+3. Trigger the pipeline manually on the `uat/conn_mgmt/1.0` branch
+4. Pipeline detects: environment=UAT, project=conn_mgmt
+5. Only items in the `/conn_mgmt/` folder are deployed
 
+### Promote to Production
 
-### Run the Full Pipeline
+1. Create `prod/conn_mgmt/1.0` from `uat/conn_mgmt/1.0`
+2. Trigger the pipeline on the `prod/conn_mgmt/1.0` branch
 
-Trigger the pipeline in Azure DevOps with the default parameters. This runs all 5 stages:
+### Recreate Connections Only
 
-```
-deployMode: full
-environment: UAT
-workspaceId: <UAT workspace GUID>
-devWorkspaceName: cicd-conn-mgmt-dev
-uatWorkspaceName: cicd-conn-mgmt-uat
-groupId: <AAD group GUID>
-initNotebookName: conn_mgmt_init_nb
-```
+Set `deployMode: connections-only` — skips Stages 1–3.
 
-### Recreate Connections Only (no full redeploy)
-
-Use `connections-only` mode to fix or recreate connections without touching other artifacts:
-
-```
-deployMode: connections-only
-environment: UAT
-workspaceId: <UAT workspace GUID>
-uatWorkspaceName: cicd-conn-mgmt-uat
-groupId: <AAD group GUID>
-```
-
-### Run Deployment Script Locally
-
-Requires `az login` first, then:
+### Run Locally
 
 ```bash
-# Install dependency
 pip install fabric-cicd
+az login
 
-# Deploy everything
 python .deploy/deploy_fabric.py \
   --workspace-id <workspace-guid> \
-  --environment UAT
+  --environment UAT \
+  --project conn_mgmt
 
 # Deploy only Semantic Models
 python .deploy/deploy_fabric.py \
   --workspace-id <workspace-guid> \
   --environment UAT \
+  --project conn_mgmt \
   --items SemanticModel
-
-# Deploy multiple specific types
-python .deploy/deploy_fabric.py \
-  --workspace-id <workspace-guid> \
-  --environment UAT \
-  --items SemanticModel Notebook Report
 ```
 
 ---
 
-## 10. Prerequisites
+## 11. Prerequisites
 
 ### Azure DevOps
 
-- An Azure DevOps pipeline connected to this repository
-- An **Azure service connection** (service principal) with:
-  - Contributor or Member access to the target Fabric workspace
-  - Permissions to create Fabric connections (Fabric tenant settings)
-- Pipeline variables configured:
-  - `azureServiceConnection` — the service connection name
-  - `FAB_CLIENT_ID` — service principal app ID
-  - `FAB_CLIENT_SECRET` — service principal secret *(mark as secret)*
-  - `FAB_TENANT_ID` — Azure AD tenant ID
+- Pipeline connected to this repository
+- **Azure service connection** (service principal) with workspace Member/Admin access
+- **Variable groups** configured:
+  - `fabric-uat` — `targetWorkspaceId`, `targetWorkspaceName`, `groupId`, `userIds`, `azureServiceConnection`
+  - `fabric-prod` — `targetWorkspaceId`, `targetWorkspaceName`, `groupId`, `userIds`, `azureServiceConnection`
+- Pipeline secret variables: `FAB_CLIENT_ID`, `FAB_CLIENT_SECRET`, `FAB_TENANT_ID`
 
 ### Fabric Workspace
 
-- DEV and UAT/PROD workspaces provisioned
-- Fabric items checked into this repository from the DEV workspace
-- Service principal added as a Member or Admin on both workspaces
+- DEV, UAT, and PROD workspaces provisioned
+- Items organized into **workspace folders** matching project names
+- Service principal added as Member or Admin on all workspaces
 
 ### Runtime (installed automatically by pipeline)
 
