@@ -4,8 +4,11 @@
 
 .DESCRIPTION
     Lists workspace items using Fabric CLI and captures metadata for data objects
-    (Lakehouse, Warehouse, etc.), including SQL endpoint properties for Lakehouses.
-    Optionally updates parameter.yml with dynamic fabric-cicd find_replace tokens.
+    (Lakehouse, Warehouse, Dataflow, etc.), including SQL endpoint properties for
+    Lakehouses. Optionally updates parameter.yml with dynamic fabric-cicd
+    find_replace tokens. Dataflow references found in mashup.pq are emitted as
+    regex replacements with Dataflow item and file_path filters so they can be
+    resolved with $items.Dataflow.<name>.$id.
 
 .PARAMETER WorkspaceName
     Fabric workspace name to capture artifacts from.
@@ -36,14 +39,37 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Parse JSON emitted by the Fabric CLI, tolerating any non-JSON status/warning
+# lines the CLI may print before the payload (e.g. "Unable to ...", spinners).
+# Returns $null when no JSON object/array can be found in the output.
+function ConvertFrom-FabJson {
+    param([Parameter(ValueFromPipeline)][string[]]$Raw)
+    $text = ($Raw -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $start = $text.IndexOfAny([char[]]@('{', '['))
+    if ($start -lt 0) { return $null }
+    $end = [Math]::Max($text.LastIndexOf('}'), $text.LastIndexOf(']'))
+    if ($end -lt $start) { return $null }
+    return $text.Substring($start, $end - $start + 1) | ConvertFrom-Json
+}
+
 # Data object types to capture
 $DATA_OBJECT_TYPES = @(
     "Lakehouse",
     "Warehouse",
+    "Dataflow",
     "Eventhouse",
     "KQLDatabase",
     "MirroredDatabase",
     "SQLDatabase"
+)
+
+# Fabric auto-generates hidden system items (e.g. the staging Lakehouse/Warehouse
+# behind Dataflows Gen2) that are not shown in the UI and must not be captured.
+# Item names matching any of these patterns are skipped.
+$SYSTEM_ITEM_PATTERNS = @(
+    '^Staging(Lakehouse|Warehouse)ForDataflows',
+    '^DataflowsStaging(Lakehouse|Warehouse)'
 )
 
 # Resolve default paths
@@ -63,8 +89,11 @@ Write-Host "Capturing artifacts from workspace: $WorkspaceName"
 [string]$workspacePath = "$WorkspaceName.Workspace"
 Write-Host "Running: fab ls $workspacePath -l --output_format json"
 $rawOutput = fab ls $workspacePath -l --output_format json
-$response = ($rawOutput -join "`n") | ConvertFrom-Json
+$response = ConvertFrom-FabJson $rawOutput
 
+if (-not $response) {
+    throw "Fabric CLI returned no parseable JSON for '$workspacePath'. Raw output: $(($rawOutput -join ' ').Trim())"
+}
 if ($response.status -ne "Success") {
     throw "Fabric CLI returned status: $($response.status)"
 }
@@ -74,7 +103,10 @@ $allItems = $response.result.data
 # --- Capture workspace ID ---
 Write-Host "Capturing workspace ID..."
 $rawWs = fab get $workspacePath -q .
-$wsJson = ($rawWs -join "`n") | ConvertFrom-Json
+$wsJson = ConvertFrom-FabJson $rawWs
+if (-not $wsJson) {
+    throw "Could not parse workspace metadata for '$workspacePath'. Raw output: $(($rawWs -join ' ').Trim())"
+}
 $workspaceId = $wsJson.id
 Write-Host "  Workspace ID: $workspaceId"
 
@@ -103,6 +135,12 @@ foreach ($item in $allItems) {
     # Skip SQLEndpoint items — we get connectionString and id from fab get on the Lakehouse
     if ($itemType -eq "SQLEndpoint") { continue }
 
+    # Skip Fabric-generated system items (e.g. Dataflows Gen2 staging Lakehouse/Warehouse)
+    if ($SYSTEM_ITEM_PATTERNS | Where-Object { $itemName -match $_ }) {
+        Write-Host "  Skipping system-generated item: $itemName ($itemType)"
+        continue
+    }
+
     # Capture data object types
     if ($itemType -in $DATA_OBJECT_TYPES) {
         if (-not $mapping.items.Contains($itemType)) {
@@ -117,30 +155,53 @@ foreach ($item in $allItems) {
         # Get SQL endpoint properties for Lakehouses
         if ($itemType -eq "Lakehouse") {
             [string]$lhPath = "$WorkspaceName.Workspace/$itemName.Lakehouse"
-            try {
-                $rawLh = fab get $lhPath -q .
-                $lhJson = ($rawLh -join "`n") | ConvertFrom-Json
-                $sqlEndpointProps = $lhJson.properties.sqlEndpointProperties
-                $rawConnString = $sqlEndpointProps.connectionString
-                $connString = ($rawConnString -replace '^(.+?)(\.datawarehouse)', { $_.Groups[1].Value.ToUpper() + $_.Groups[2].Value })
-                $sqlId = $sqlEndpointProps.id
+            $sqlProps = [ordered]@{}
+            $maxAttempts = 3
 
-                $sqlProps = [ordered]@{}
-                if ($connString) { $sqlProps.connectionString = $connString }
-                if ($sqlId) { $sqlProps.id = $sqlId }
+            for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                try {
+                    $rawLh = fab get $lhPath -q .
+                    $lhJson = ConvertFrom-FabJson $rawLh
 
-                if ($sqlProps.Count -gt 0) {
-                    if ($mapping.sql_endpoints.Contains($itemName)) {
-                        foreach ($key in $sqlProps.Keys) {
-                            $mapping.sql_endpoints[$itemName][$key] = $sqlProps[$key]
-                        }
-                    } else {
-                        $mapping.sql_endpoints[$itemName] = $sqlProps
+                    if (-not $lhJson) {
+                        $snippet = ($rawLh -join ' ').Trim()
+                        if ($snippet.Length -gt 200) { $snippet = $snippet.Substring(0, 200) + '...' }
+                        Write-Host "    Attempt ${attempt}/${maxAttempts}: no JSON from 'fab get $lhPath' (raw: $snippet)"
+                        Start-Sleep -Seconds 10
+                        continue
                     }
-                    Write-Host "    SQL Endpoint: $connString"
+
+                    $sqlEndpointProps = $lhJson.properties.sqlEndpointProperties
+                    $rawConnString = $sqlEndpointProps.connectionString
+                    $sqlId = $sqlEndpointProps.id
+
+                    if ($rawConnString) {
+                        $sqlProps.connectionString = ($rawConnString -replace '^(.+?)(\.datawarehouse)', { $_.Groups[1].Value.ToUpper() + $_.Groups[2].Value })
+                    }
+                    if ($sqlId) { $sqlProps.id = $sqlId }
+
+                    if ($sqlProps.Count -gt 0) { break }
+
+                    # Item exists but the SQL analytics endpoint hasn't populated yet.
+                    Write-Host "    Attempt ${attempt}/${maxAttempts}: SQL endpoint for ${itemName} not populated yet"
+                    Start-Sleep -Seconds 10
+                } catch {
+                    Write-Host "    Attempt ${attempt}/${maxAttempts}: error reading SQL endpoint for ${itemName}: $_"
+                    Start-Sleep -Seconds 10
                 }
-            } catch {
-                Write-Host "    Warning: Could not get SQL endpoint for ${itemName}: $_"
+            }
+
+            if ($sqlProps.Count -gt 0) {
+                if ($mapping.sql_endpoints.Contains($itemName)) {
+                    foreach ($key in $sqlProps.Keys) {
+                        $mapping.sql_endpoints[$itemName][$key] = $sqlProps[$key]
+                    }
+                } else {
+                    $mapping.sql_endpoints[$itemName] = $sqlProps
+                }
+                Write-Host "    SQL Endpoint: $($sqlProps.connectionString)"
+            } else {
+                Write-Host "    Warning: SQL endpoint for ${itemName} could not be captured (may still be provisioning, or the service principal lacks access)"
             }
         }
     }
@@ -181,9 +242,52 @@ if ($UpdateParameterYml) {
         Write-Host "  find_replace: $($mapping.workspace_id) -> `$workspace.`$id"
     }
 
+    # Dataflow references in mashup.pq need a regex capture group and a file
+    # filter. This follows the fabric-cicd Dataflow guidance and avoids
+    # replacing an unrelated occurrence of the same GUID elsewhere in the repo.
+    $dataflowFiles = @(Get-ChildItem -Path $rootDir -Recurse -File -Filter "mashup.pq" |
+        Where-Object { $_.DirectoryName -match '\.Dataflow$' })
+
     foreach ($itemType in $mapping.items.Keys) {
         foreach ($itemName in $mapping.items[$itemType].Keys) {
             $info = $mapping.items[$itemType][$itemName]
+
+            if ($itemType -eq "Dataflow") {
+                foreach ($dataflowFile in $dataflowFiles) {
+                    $relativePath = $dataflowFile.FullName.Substring($rootDir.Length).TrimStart('\', '/') -replace '\\', '/'
+                    $relativePath = "/$relativePath"
+                    $dataflowLines = Get-Content -Path $dataflowFile.FullName
+
+                    foreach ($line in $dataflowLines) {
+                        $idIndex = $line.IndexOf($info.id, [System.StringComparison]::OrdinalIgnoreCase)
+                        if ($idIndex -lt 0) { continue }
+
+                        $escapedLine = [regex]::Escape($line)
+                        $escapedId = [regex]::Escape($info.id)
+                        $escapedIdIndex = $escapedLine.IndexOf($escapedId, [System.StringComparison]::OrdinalIgnoreCase)
+                        if ($escapedIdIndex -lt 0) { continue }
+
+                        # Capture only the source Dataflow ID as group 1.
+                        $regex = $escapedLine.Substring(0, $escapedIdIndex) +
+                            "($escapedId)" +
+                            $escapedLine.Substring($escapedIdIndex + $escapedId.Length)
+
+                        $findReplaceEntries += [ordered]@{
+                            find_value    = $regex
+                            replace_value = [ordered]@{
+                                _ALL_ = "`$items.Dataflow.$itemName.`$id"
+                            }
+                            is_regex      = "true"
+                            item_type     = "Dataflow"
+                            item_name     = $dataflowFile.Directory.Name.Substring(0, $dataflowFile.Directory.Name.Length - ".Dataflow".Length)
+                            file_path     = $relativePath
+                        }
+                        Write-Host "  find_replace regex: $($info.id) -> `$items.Dataflow.$itemName.`$id ($relativePath)"
+                    }
+                }
+                continue
+            }
+
             $findReplaceEntries += [ordered]@{
                 find_value    = $info.id
                 replace_value = [ordered]@{

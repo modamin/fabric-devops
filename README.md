@@ -1,6 +1,6 @@
 # Fabric Connection Management — CI/CD Pipeline
 
-> **Purpose:** This document explains the end-to-end DevOps automation that deploys Microsoft Fabric workspaces across environments (DEV → UAT → PROD) using a trunk-based branching model with project-based folder filtering, solves the ID-remapping problem, and automatically creates and binds SQL connections for Semantic Models.
+> **Purpose:** This document explains the end-to-end DevOps automation that deploys Microsoft Fabric workspaces across environments (DEV → UAT → PROD) using a trunk-based branching model with config-driven selective deployment, solves the ID-remapping problem, and automatically creates and binds SQL connections for Semantic Models.
 
 ---
 
@@ -22,67 +22,69 @@
 
 ## 1. Branching Model
 
-This repository follows **trunk-based development (Option 4)** for Fabric CI/CD with **project-based folder filtering**.
+This repository follows **trunk-based development (Option 4)** for Fabric CI/CD — specifically, trunk-based development with short-lived, environment-scoped **release branches** (a "release-branch-per-environment" pattern). It is **not** Git Flow: there is no long-lived `develop` branch and no permanent `release`/`hotfix`/`feature` branch hierarchy. What gets deployed is driven by [`.deploy/config/deployment_selection.yml`](.deploy/config/deployment_selection.yml), **not** by the branch name.
 
 ### Branch Strategy
 
 | Branch | Purpose | Deployment |
 |--------|---------|------------|
 | `main` | Integration branch | Synced to **dev** workspace via **Update from GIT** (no pipeline runs) |
-| `uat/<project>/x.y` | Release candidate | Deploys only `<project>` folder to **UAT** workspace via `fabric-cicd` |
-| `prod/<project>/x.y` | Production release | Deploys only `<project>` folder to **PROD** workspace via `fabric-cicd` |
+| `uat/x.y` | Release candidate | Deploys to **UAT** workspace via `fabric-cicd` |
+| `prod/x.y` | Production release | Deploys to **PROD** workspace via `fabric-cicd` |
 
 ### Release Workflow
 
 ```
 main (dev workspace — synced via "Update from GIT")
   │
-  ├── Create Branch ──▶ uat/conn_mgmt/1.0 ──▶ fabric-cicd ──▶ UAT workspace (conn_mgmt folder only)
-  │                          │
-  │                     Create Branch ──▶ prod/conn_mgmt/1.0 ──▶ fabric-cicd ──▶ Prod workspace
+  ├── Create Branch ──▶ uat/1.0 ──▶ fabric-cicd ──▶ UAT workspace
+  │                     │
+  │                Create Branch ──▶ prod/1.0 ──▶ fabric-cicd ──▶ Prod workspace
   │
-  ├── Create Branch ──▶ uat/conn_mgmt/1.1 ──▶ fabric-cicd ──▶ UAT workspace (conn_mgmt folder only)
-  │                          │
-  │                     Create Branch ──▶ prod/conn_mgmt/1.1 ──▶ fabric-cicd ──▶ Prod workspace
-  │
-  ├── Create Branch ──▶ uat/other_project/1.0 ──▶ fabric-cicd ──▶ UAT workspace (other_project folder only)
+  ├── Create Branch ──▶ uat/1.1 ──▶ fabric-cicd ──▶ UAT workspace
+  │                     │
+  │                Create Branch ──▶ prod/1.1 ──▶ fabric-cicd ──▶ Prod workspace
   │
   └── ...
 ```
 
-### Project-Based Filtering
+### Selecting What to Deploy
 
-The branch name encodes which project to deploy:
+The branch name only encodes the **environment** and **version**. The set of folders and items to deploy is defined in the selective-deployment config:
 
 ```
-uat/<project_name>/<version>
-     └─────┬─────┘
-           │
-           ▼
-  folder_path_to_include = ["/<project_name>"]
+uat/<version>
+ └─┬─┘
+   │
+   ▼
+ environment (UAT/PROD) auto-detected from branch prefix
+
+.deploy/config/deployment_selection.yml
+   │
+   ▼
+ folders + single items to deploy (see Section 8)
 ```
 
-- The pipeline extracts `<project_name>` from the branch (2nd segment)
-- Only items inside the `/<project_name>/` workspace folder are deployed
-- Items in other folders or at the root are **not** deployed
+- The pipeline auto-detects the **environment** from the branch prefix (`uat/*` or `prod/*`)
+- The **folders/items** to deploy come from [`.deploy/config/deployment_selection.yml`](.deploy/config/deployment_selection.yml)
+- Items not listed in the config are **not** deployed
 - This allows multiple teams/projects to share a single repository and workspace
 
 ### Release History
 
 | UAT Branches | Prod Branches |
 |--------------|---------------|
-| `uat/conn_mgmt/1.0` | `prod/conn_mgmt/1.0` |
-| `uat/conn_mgmt/1.1` | `prod/conn_mgmt/1.1` |
-| `uat/other_project/1.0` | `prod/other_project/1.0` |
+| `uat/1.0` | `prod/1.0` |
+| `uat/1.1` | `prod/1.1` |
 
 ### Key Principles
 
 - **No long-lived branches** for UAT and PROD — each release creates new short-lived branches
 - **main** is always the source of truth — developers commit to main, which syncs to the dev workspace
 - **Environment is auto-detected** from the branch prefix (`uat/*` or `prod/*`)
-- **Project is auto-detected** from the branch name (2nd segment)
+- **What to deploy** is config-driven via `.deploy/config/deployment_selection.yml`
 - **Pipeline rejects runs from main** — the dev workspace is managed entirely via "Update from GIT"
-- **Branch must have 3 segments** — `env/project/version` format is validated
+- **Branch must have at least 2 segments** — `env/version` format (e.g. `uat/1.0`) is validated
 
 ---
 
@@ -128,13 +130,13 @@ This pipeline handles all three problems fully automatically in a 5-stage orches
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        Azure DevOps Pipeline                            │
-│  Branch: uat/conn_mgmt/1.0 → env=UAT, project=conn_mgmt               │
+│  Branch: uat/1.0 → env=UAT   (deployment scope from config)          │
 │                                                                         │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐              │
 │  │  Stage 1     │    │  Stage 2     │    │  Stage 3     │              │
-│  │  Capture     │───▶│  Deploy All  │───▶│  Initialize  │              │
-│  │  Artifact IDs│    │  (project    │    │  Data        │              │
-│  │              │    │   folder)    │    │              │              │
+│  │  Capture     │───▶│  Selective   │───▶│  Initialize  │              │
+│  │  Artifact IDs│    │  Deployment  │    │  Data        │              │
+│  │              │    │  (config)    │    │              │              │
 │  └──────────────┘    └──────────────┘    └──────┬───────┘              │
 │                                                  │                      │
 │                         ┌────────────────────────▼─────────────┐       │
@@ -144,7 +146,7 @@ This pipeline handles all three problems fully automatically in a 5-stage orches
 │                                                  │                      │
 │                         ┌────────────────────────▼─────────────┐       │
 │                         │  Stage 5: Deploy Semantic Models      │       │
-│                         │  (project folder, with bindings)      │       │
+│                         │  (selected items, with bindings)      │       │
 │                         └──────────────────────────────────────┘       │
 └─────────────────────────────────────────────────────────────────────────┘
 
@@ -193,6 +195,17 @@ publish_all_items(
 )
 unpublish_all_orphan_items(target_workspace)
 ```
+
+#### Important: selective deployment caveat
+
+When a deployment includes a mix of folder-level includes and individual single items, the implementation must use a separate `FabricWorkspace` instance for each pass.
+
+`fabric-cicd` stores selective deployment filters (`folder_path_to_include`, `items_to_include`) on the workspace object. If the same workspace object is reused across passes, the first pass can leak its folder filter into the second pass and cause items in other folders to be skipped. This is why the repository's deploy script performs the deployment as two separate passes:
+
+1. Folder pass: deploy the project folder and its subfolders
+2. Single-item pass: deploy named items like `item_name.Notebook`
+
+The fix is to create a fresh workspace object for each publish call so that filter state does not persist between passes.
 
 ---
 
@@ -250,8 +263,8 @@ The pipeline is defined in [azure-pipelines.yml](azure-pipelines.yml) and trigge
 
 | Branch Pattern | Environment | Variable Group |
 |----------------|-------------|----------------|
-| `uat/<project>/*` | UAT | `fabric-uat` |
-| `prod/<project>/*` | PROD | `fabric-prod` |
+| `uat/*` | UAT | `fabric-uat` |
+| `prod/*` | PROD | `fabric-prod` |
 | `main` | *(rejected)* | — |
 
 ### Pipeline Parameters
@@ -260,7 +273,20 @@ The pipeline is defined in [azure-pipelines.yml](azure-pipelines.yml) and trigge
 |-----------|-------------|---------|
 | `devWorkspaceName` | Name of the DEV workspace to read IDs from | `cicd-conn-mgmt-dev` |
 | `initNotebookName` | Name of the notebook to run for data initialization | `conn_mgmt_init_nb` |
-| `deployMode` | `full` or `connections-only` | `full` |
+| `selectiveDeployConfig` | Path to the selective-deployment YAML config | `.deploy/config/deployment_selection.yml` |
+
+### Stage Toggles
+
+Each stage is enabled or disabled independently before queueing the run — there is no combined "deploy mode". Set the toggles for the stages you want to run.
+
+| Toggle | Stage | Default |
+|--------|-------|---------|
+| `runCaptureArtifactIds` | Capture Artifact IDs | `true` |
+| `runDeployAllArtifacts` | Deploy All Artifacts (whole repo) | `false` |
+| `runSelectiveDeployment` | Selective Deployment (folders + single items) | `true` |
+| `runInitializeData` | Initialize Data | `true` |
+| `runCreateSMConnections` | Create SM Connections | `true` |
+| `runDeploySemanticModels` | Deploy Semantic Models | `true` |
 
 ### Variable Groups (configured in Azure DevOps)
 
@@ -277,13 +303,6 @@ Each environment requires a variable group with these variables:
 - **`fabric-uat`** — for `uat/*` branches
 - **`fabric-prod`** — for `prod/*` branches
 
-### Deploy Modes
-
-| Mode | Stages Run | When to Use |
-|------|-----------|-------------|
-| `full` | All 5 stages | Full deployment — first time or after artifact changes |
-| `connections-only` | Stages 4 & 5 only | Recreate/repair connections without redeploying artifacts |
-
 ---
 
 ## 7. Stage-by-Stage Walkthrough
@@ -293,9 +312,8 @@ Each environment requires a variable group with these variables:
 **Condition:** Always runs
 
 **What it does:**
-- Validates the branch follows the `uat/<project>/<version>` or `prod/<project>/<version>` format (3 segments minimum)
-- Extracts the project name from the 2nd segment
-- Sets the `projectName` output variable consumed by Stages 2 and 5
+- Validates the branch follows the `uat/<version>` or `prod/<version>` format (at least 2 segments, e.g. `uat/1.0`)
+- Auto-detects the environment (UAT/PROD) from the branch prefix
 - Rejects runs from `main` or any branch that doesn't match `uat/*` or `prod/*`
 
 ---
@@ -304,7 +322,7 @@ Each environment requires a variable group with these variables:
 
 **Script:** [.deploy/capture_artifact_ids.ps1](.deploy/capture_artifact_ids.ps1)
 **Runs on:** DEV workspace
-**Condition:** `deployMode == 'full'`
+**Condition:** `runCaptureArtifactIds == true`
 
 **What it does:**
 Reads DEV workspace artifact IDs and generates `parameter.yml` with find_replace entries for ID substitution.
@@ -325,6 +343,14 @@ find_replace:
     replace_value:
       _ALL_: $items.Lakehouse.conn_mgmt_lh.$sqlendpointid
 
+  - find_value: Navigation\s*=\s*Navigation\{\[dataflowId\s*=\s*"(0187104d-7a35-4abe-a2ca-a241ec81c8f1)"\]\}
+    replace_value:
+      _ALL_: $items.Dataflow.Source Dataflow.$id
+    is_regex: "true"
+    item_type: Dataflow
+    item_name: Referencing Dataflow
+    file_path: /Project_B/Referencing Dataflow.Dataflow/mashup.pq
+
   - find_value: ABC123XY.datawarehouse.fabric.microsoft.com # DEV SQL conn string
     replace_value:
       _ALL_: $items.Lakehouse.conn_mgmt_lh.$sqlendpoint
@@ -332,27 +358,30 @@ find_replace:
 
 ---
 
-### Stage 2 — Deploy All Artifacts (Project Folder Only)
+### Stage 2 — Selective Deployment (config-driven)
 
 **Script:** [.deploy/deploy_fabric.py](.deploy/deploy_fabric.py)
 **Runs on:** Target workspace (UAT/PROD)
-**Key feature:** `--project <name>` → `folder_path_to_include=["/name"]`
+**Key feature:** `--deploy-config <yaml>` → deploys the folders and single items listed in [`.deploy/config/deployment_selection.yml`](.deploy/config/deployment_selection.yml)
 
 **What it does:**
-Deploys only items within the project's workspace folder, substituting DEV IDs with target environment IDs.
+Deploys the folders and individual items defined in the selective-deployment config, substituting DEV IDs with target environment IDs. When the config lists both folders and single items, deployment runs in two passes (see [Section 8](#8-key-configuration-files)).
 
 ```bash
 python .deploy/deploy_fabric.py \
   --workspace-id "$(targetWorkspaceId)" \
   --environment "$(environment)" \
-  --project "$(projectName)"
+  --deploy-config "$(selectiveDeployConfig)"
 ```
+
+> To deploy the entire repository instead, enable the separate **Deploy All Artifacts** stage, which runs `deploy_fabric.py` with no folder/item filter.
 
 **Feature flags enabled:**
 
 | Flag | Purpose |
 |------|---------|
 | `enable_include_folder` | Enables `folder_path_to_include` filtering |
+| `enable_items_to_include` | Enables `items_to_include` (single-item) filtering |
 | `enable_lakehouse_unpublish` | Allows lakehouses to be removed as orphans |
 | `enable_experimental_features` | Required for selective deployment features |
 
@@ -373,7 +402,7 @@ Triggers a Fabric Notebook in the target workspace to seed or initialize data. P
 **Runs on:** Target workspace (UAT/PROD)
 
 **What it does:**
-1. Reads `connection_mapping.<env>.json` to find which connections are needed
+1. Reads the `<env>` section of `.deploy/config/connection_mapping.yml` to find which connections are needed
 2. Queries target Lakehouse SQL endpoint
 3. Creates SQL connections (if they don't exist) using the service principal
 4. Grants Owner access to the AAD group and users (from variable group)
@@ -381,18 +410,18 @@ Triggers a Fabric Notebook in the target workspace to seed or initialize data. P
 
 ---
 
-### Stage 5 — Deploy Semantic Models (Project Folder Only)
+### Stage 5 — Deploy Semantic Models (config-driven)
 
 **Script:** [.deploy/deploy_fabric.py](.deploy/deploy_fabric.py) (with `--items SemanticModel`)
 **Runs on:** Target workspace (UAT/PROD)
 
-Redeploys only Semantic Models within the project folder, using the updated `parameter.yml` that now includes connection bindings.
+Redeploys only the Semantic Models within the selective-deployment scope, using the updated `parameter.yml` that now includes connection bindings.
 
 ```bash
 python .deploy/deploy_fabric.py \
   --workspace-id "$(targetWorkspaceId)" \
   --environment "$(environment)" \
-  --project "$(projectName)" \
+  --deploy-config "$(selectiveDeployConfig)" \
   --items SemanticModel
 ```
 
@@ -400,18 +429,20 @@ python .deploy/deploy_fabric.py \
 
 ## 8. Key Configuration Files
 
-### `connection_mapping.uat.json` / `connection_mapping.prod.json`
+### `.deploy/config/connection_mapping.yml`
 
-Environment-specific connection mapping files. The pipeline automatically selects the correct file based on the detected environment.
+A single mapping file with one section per environment (`uat` / `prod`). The pipeline reads the section matching the detected environment.
 
-```json
-[
-  {
-    "connection_name": "my-connection-1939",
-    "semantic_model_name": "conn_mgmt_sm",
-    "lakehouse_name": "conn_mgmt_lh"
-  }
-]
+```yaml
+uat:
+  - connection_name: my-connection-1939
+    semantic_model_name: conn_mgmt_sm
+    lakehouse_name: conn_mgmt_lh
+
+prod:
+  - connection_name: my-connection-1939
+    semantic_model_name: conn_mgmt_sm
+    lakehouse_name: conn_mgmt_lh
 ```
 
 ### `parameter.yml`
@@ -419,6 +450,23 @@ Environment-specific connection mapping files. The pipeline automatically select
 **Auto-generated by the pipeline — do not edit manually.**
 
 Built in Stage 1 (find_replace entries) and extended in Stage 4 (semantic_model_binding).
+
+### `.deploy/config/deployment_selection.yml`
+
+Config for **selective deployment** via `deploy_fabric.py --deploy-config`. Lets you deploy a combination of whole folders and individual items in a single run:
+
+```yaml
+folders:
+  - Project_D                 # deploys this folder AND all of its subfolders
+
+files:
+  - conn_mgmt_single_items_nb.Notebook   # single items, in "item_name.item_type" format
+```
+
+- `folders` — each listed folder and all of its subfolders are deployed (the script walks the repo folder structure, so subfolders do not need to be listed).
+- `files` — individual items, in `item_name.item_type` format.
+
+When both `folders` and `files` are present, the script runs a **two-pass deployment** (one pass for folders, one for single items). Each pass uses its own `FabricWorkspace` object so selective-deployment filters do not leak between passes — see the caveat in [Section 4](#4-tools--libraries).
 
 ### `azure-pipelines.yml`
 
@@ -432,12 +480,12 @@ Defines the 6 pipeline stages (0–5), their order, conditions, and parameters.
 conn_mgmt/
 │
 ├── azure-pipelines.yml                # Pipeline definition (6 stages)
-├── connection_mapping.uat.json        # UAT: SM → Lakehouse connection mappings
-├── connection_mapping.prod.json       # Prod: SM → Lakehouse connection mappings
-├── connection_mapping.json            # Reference template (not used by pipeline)
 ├── parameter.yml                      # Auto-generated by pipeline (do not edit)
 │
-├── .deploy/                           # All deployment automation scripts
+├── .deploy/                           # All deployment automation scripts + config
+│   ├── config/                        # Deployment configuration (YAML)
+│   │   ├── deployment_selection.yml   # Folders + single items to deploy (selective deployment)
+│   │   └── connection_mapping.yml     # SM → Lakehouse connection mappings (uat + prod sections)
 │   ├── capture_artifact_ids.ps1       # Stage 1: reads DEV IDs, generates parameter.yml
 │   ├── deploy_fabric.py              # Stages 2 & 5: deploys artifacts via fabric-cicd
 │   ├── install_fab_cli.ps1            # Installs ms-fabric-cli and authenticates
@@ -464,20 +512,20 @@ conn_mgmt/
 
 ### Full Deployment
 
-1. Ensure items are inside the project folder (e.g., `conn_mgmt/conn_mgmt_sm.SemanticModel/`)
-2. Create a release branch: `uat/conn_mgmt/1.0` from `main`
-3. Trigger the pipeline manually on the `uat/conn_mgmt/1.0` branch
-4. Pipeline detects: environment=UAT, project=conn_mgmt
-5. Only items in the `/conn_mgmt/` folder are deployed
+1. List the folders/items to deploy in [`.deploy/config/deployment_selection.yml`](.deploy/config/deployment_selection.yml)
+2. Create a release branch: `uat/1.0` from `main`
+3. Trigger the pipeline manually on the `uat/1.0` branch
+4. Pipeline detects: environment=UAT
+5. Only the folders/items listed in the config are deployed
 
 ### Promote to Production
 
-1. Create `prod/conn_mgmt/1.0` from `uat/conn_mgmt/1.0`
-2. Trigger the pipeline on the `prod/conn_mgmt/1.0` branch
+1. Create `prod/1.0` from `uat/1.0`
+2. Trigger the pipeline on the `prod/1.0` branch
 
 ### Recreate Connections Only
 
-Set `deployMode: connections-only` — skips Stages 1–3.
+Disable the earlier stage toggles (Capture Artifact IDs, Selective Deployment, Initialize Data) and run only the connection + Semantic Model stages.
 
 ### Run Locally
 
@@ -485,18 +533,32 @@ Set `deployMode: connections-only` — skips Stages 1–3.
 pip install fabric-cicd
 az login
 
+# Deploy the folders/items from the selection config
 python .deploy/deploy_fabric.py \
   --workspace-id <workspace-guid> \
   --environment UAT \
-  --project conn_mgmt
+  --deploy-config .deploy/config/deployment_selection.yml
 
-# Deploy only Semantic Models
+# Deploy only Semantic Models within the selection scope
 python .deploy/deploy_fabric.py \
   --workspace-id <workspace-guid> \
   --environment UAT \
-  --project conn_mgmt \
+  --deploy-config .deploy/config/deployment_selection.yml \
   --items SemanticModel
 ```
+
+### Selective Deployment (folders + single items)
+
+Use `--deploy-config` to deploy a mix of whole folders and individual items defined in a YAML file (see [`.deploy/config/deployment_selection.yml`](.deploy/config/deployment_selection.yml)):
+
+```bash
+python .deploy/deploy_fabric.py \
+  --workspace-id <workspace-guid> \
+  --environment UAT \
+  --deploy-config .deploy/config/deployment_selection.yml
+```
+
+When the config contains both `folders` and `files`, the script deploys them as two separate passes (folders first, then single items). Each pass gets a fresh `FabricWorkspace` object so the folder filter from the first pass cannot cause single items in other folders to be skipped.
 
 ---
 

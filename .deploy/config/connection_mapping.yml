@@ -1,0 +1,19 @@
+# Connection mapping for Stage 4 (Create SM Connections).
+#
+# One file, one section per environment. The pipeline selects the section
+# matching the detected environment (uat or prod).
+#
+# Each entry creates/binds a Fabric SQL connection for a Semantic Model:
+#   connection_name     — name of the Fabric connection to create/reuse
+#   semantic_model_name — Semantic Model to bind the connection to
+#   lakehouse_name      — Lakehouse whose SQL endpoint the connection targets
+
+uat:
+  - connection_name: my-connection-1939
+    semantic_model_name: conn_mgmt_sm
+    lakehouse_name: conn_mgmt_lh
+
+prod:
+  - connection_name: my-connection-1939
+    semantic_model_name: conn_mgmt_sm
+    lakehouse_name: conn_mgmt_lh

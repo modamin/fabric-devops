@@ -3,7 +3,7 @@
     Create semantic model connections and update parameter.yml with bindings.
 
 .DESCRIPTION
-    Reads a JSON mapping file to create Fabric SQL connections for semantic models,
+    Reads a YAML mapping file to create Fabric SQL connections for semantic models,
     using SQL endpoint details from the target workspace. Appends semantic_model_binding
     entries to an existing parameter.yml file.
 
@@ -11,7 +11,11 @@
     Fabric workspace name to query SQL endpoints from (e.g., UAT or PROD workspace).
 
 .PARAMETER ConnectionMappingPath
-    Path to a JSON file mapping connections to semantic models and lakehouses.
+    Path to a YAML file with one section per environment (uat / prod), each listing
+    connections to create for semantic models and lakehouses.
+
+.PARAMETER Environment
+    Environment section to read from the mapping file (e.g., uat or prod).
 
 .PARAMETER GroupId
     AAD Group ID to grant Owner access on created connections.
@@ -24,7 +28,8 @@
 
 .EXAMPLE
     .\create_sm_connections_stage.ps1 -TargetWorkspaceName "cicd-conn-mgmt-uat" `
-        -ConnectionMappingPath ".\connection_mapping.json" `
+        -ConnectionMappingPath ".\.deploy\config\connection_mapping.yml" `
+        -Environment "uat" `
         -GroupId "bd9da7e3-1acd-476b-9159-3674a310f890" `
         -UserIds "user-object-id-1,user-object-id-2" `
         -ParameterYmlPath ".\parameter.yml"
@@ -33,6 +38,7 @@
 param(
     [Parameter(Mandatory)][string]$TargetWorkspaceName,
     [Parameter(Mandatory)][string]$ConnectionMappingPath,
+    [Parameter(Mandatory)][string]$Environment,
     [string]$GroupId,
     [string]$UserIds,
     [Parameter(Mandatory)][string]$ParameterYmlPath
@@ -51,8 +57,15 @@ if (-not (Get-Module -ListAvailable -Name powershell-yaml)) {
 Import-Module powershell-yaml
 
 # --- Read connection mapping ---
-Write-Host "=== Creating connections from mapping file: $ConnectionMappingPath ==="
-$connectionMapping = Get-Content $ConnectionMappingPath -Raw | ConvertFrom-Json
+Write-Host "=== Creating connections from mapping file: $ConnectionMappingPath (environment: $Environment) ==="
+$mappingConfig = Get-Content $ConnectionMappingPath -Raw | ConvertFrom-Yaml -Ordered
+
+# Select the section matching the target environment (case-insensitive).
+$envKey = ($mappingConfig.Keys | Where-Object { $_ -ieq $Environment } | Select-Object -First 1)
+if (-not $envKey) {
+    throw "Environment section '$Environment' not found in $ConnectionMappingPath. Available: $($mappingConfig.Keys -join ', ')"
+}
+$connectionMapping = $mappingConfig[$envKey]
 
 $semanticModelBindings = @()
 

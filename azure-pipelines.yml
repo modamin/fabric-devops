@@ -2,11 +2,13 @@
 # Trunk-Based Deployment Pipeline
 # =============================================================================
 # Branching model (Option 4):
-#   - main                    → synced to dev workspace via "Update from GIT" (no pipeline runs)
-#   - uat/<project>/x.y      → deployed to uat workspace via fabric-cicd (project folder only)
-#   - prod/<project>/x.y     → deployed to prod workspace via fabric-cicd (project folder only)
+#   - main            → synced to dev workspace via "Update from GIT" (no pipeline runs)
+#   - uat/x.y        → deployed to uat workspace via fabric-cicd
+#   - prod/x.y       → deployed to prod workspace via fabric-cicd
 #
-# Pipeline is manually triggered. Environment and project are auto-detected from branch name.
+# Pipeline is manually triggered. Environment is auto-detected from branch name.
+# The set of folders/items to deploy is provided in .deploy/config/deployment_selection.yml
+# (see the 'Selective Deployment' stage), not derived from the branch name.
 # Workspace configuration is loaded from Azure DevOps variable groups:
 #   - fabric-uat   (for uat/* branches) — must define: targetWorkspaceId, targetWorkspaceName
 #   - fabric-prod  (for prod/* branches) — must define: targetWorkspaceId, targetWorkspaceName
@@ -23,13 +25,41 @@ parameters:
     type: string
     default: "conn_mgmt_init_nb"
 
-  - name: deployMode
-    displayName: "Deploy Mode"
+  # --- Stage selection toggles (choose which stages to run before queueing) ---
+  - name: runCaptureArtifactIds
+    displayName: "Run: Capture Artifact IDs"
+    type: boolean
+    default: true
+
+  - name: runDeployAllArtifacts
+    displayName: "Run: Deploy All Artifacts"
+    type: boolean
+    default: false
+
+  - name: runSelectiveDeployment
+    displayName: "Run: Selective Deployment (folders + single items)"
+    type: boolean
+    default: true
+
+  - name: selectiveDeployConfig
+    displayName: "Selective Deployment Config (YAML path)"
     type: string
-    default: "full"
-    values:
-      - full
-      - connections-only
+    default: ".deploy/config/deployment_selection.yml"
+
+  - name: runInitializeData
+    displayName: "Run: Initialize Data"
+    type: boolean
+    default: true
+
+  - name: runCreateSMConnections
+    displayName: "Run: Create SM Connections"
+    type: boolean
+    default: true
+
+  - name: runDeploySemanticModels
+    displayName: "Run: Deploy Semantic Models"
+    type: boolean
+    default: true
 
 variables:
   - name: pythonVersion
@@ -77,15 +107,8 @@ stages:
               echo "Detected Environment: $(environment)"
               echo "Target Workspace ID: $(targetWorkspaceId)"
               echo "Target Workspace Name: $(targetWorkspaceName)"
-
-              # Extract project name from branch: uat/<project>/<version> or prod/<project>/<version>
-              BRANCH="$(Build.SourceBranch)"
-              BRANCH_NAME="${BRANCH#refs/heads/}"
-              PROJECT_NAME=$(echo "$BRANCH_NAME" | cut -d'/' -f2)
-              echo "Detected Project: $PROJECT_NAME"
-              echo "##vso[task.setvariable variable=projectName;isOutput=true]$PROJECT_NAME"
             name: detectConfig
-            displayName: "Detect Configuration & Project"
+            displayName: "Detect Configuration"
 
           - bash: |
               if [ -z "$(environment)" ]; then
@@ -95,12 +118,12 @@ stages:
                 exit 1
               fi
 
-              # Validate branch has project name segment: env/project/version
+              # Validate branch has a version segment: env/version (e.g. uat/1.0)
               BRANCH="$(Build.SourceBranch)"
               BRANCH_NAME="${BRANCH#refs/heads/}"
               SEGMENT_COUNT=$(echo "$BRANCH_NAME" | awk -F'/' '{print NF}')
-              if [ "$SEGMENT_COUNT" -lt 3 ]; then
-                echo "##[error]Branch must follow format: uat/<project_name>/<version> or prod/<project_name>/<version>"
+              if [ "$SEGMENT_COUNT" -lt 2 ]; then
+                echo "##[error]Branch must follow format: uat/<version> or prod/<version> (e.g. uat/1.0)"
                 echo "##[error]Got: $BRANCH_NAME"
                 exit 1
               fi
@@ -112,7 +135,7 @@ stages:
   - stage: Capture_Artifact_IDs
     displayName: "Capture Artifact IDs"
     dependsOn: Validate_Branch
-    condition: eq('${{ parameters.deployMode }}', 'full')
+    condition: and(succeeded(), eq('${{ parameters.runCaptureArtifactIds }}', 'true'))
     jobs:
       - job: CaptureIds
         displayName: "Capture Artifact Metadata"
@@ -167,9 +190,7 @@ stages:
     dependsOn:
       - Validate_Branch
       - Capture_Artifact_IDs
-    condition: eq('${{ parameters.deployMode }}', 'full')
-    variables:
-      projectName: $[ stageDependencies.Validate_Branch.ValidateBranch.outputs['detectConfig.projectName'] ]
+    condition: and(not(failed()), eq('${{ parameters.runDeployAllArtifacts }}', 'true'))
     jobs:
       - job: DeployAll
         displayName: "Deploy All Artifacts"
@@ -199,11 +220,56 @@ stages:
                 echo "Installing fabric-cicd..."
                 pip install fabric-cicd==${{ variables.fabricCicdVersion }} || pip install fabric-cicd
 
-                echo "Deploying artifacts for project: $(projectName)"
+                echo "Deploying all artifacts in the repository"
+                python .deploy/deploy_fabric.py \
+                  --workspace-id "$(targetWorkspaceId)" \
+                  --environment "$(environment)"
+            env:
+              FABRIC_WORKSPACE_ID: $(targetWorkspaceId)
+              FABRIC_ENVIRONMENT: $(environment)
+
+  # Stage 2b: Selective Deployment (folders + single items via YAML config)
+  - stage: Selective_Deployment
+    displayName: "Selective Deployment"
+    dependsOn:
+      - Validate_Branch
+      - Capture_Artifact_IDs
+    condition: and(not(failed()), eq('${{ parameters.runSelectiveDeployment }}', 'true'))
+    jobs:
+      - job: SelectiveDeploy
+        displayName: "Selective Deployment (folders + single items)"
+        pool:
+          vmImage: "windows-latest"
+        steps:
+          - task: UsePythonVersion@0
+            displayName: "Use Python ${{ variables.pythonVersion }}"
+            inputs:
+              versionSpec: "${{ variables.pythonVersion }}"
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Parameter YAML"
+            condition: eq('${{ parameters.runCaptureArtifactIds }}', 'true')
+            inputs:
+              artifactName: "parameter_yml"
+              targetPath: '$(Build.SourcesDirectory)'
+
+          - task: AzureCLI@2
+            displayName: "Install Dependencies & Run Selective Deployment"
+            inputs:
+              azureSubscription: "$(azureServiceConnection)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                set -e
+
+                echo "Installing fabric-cicd..."
+                pip install fabric-cicd==${{ variables.fabricCicdVersion }} || pip install fabric-cicd
+
+                echo "Running selective deployment using config: ${{ parameters.selectiveDeployConfig }}"
                 python .deploy/deploy_fabric.py \
                   --workspace-id "$(targetWorkspaceId)" \
                   --environment "$(environment)" \
-                  --project "$(projectName)"
+                  --deploy-config "${{ parameters.selectiveDeployConfig }}"
             env:
               FABRIC_WORKSPACE_ID: $(targetWorkspaceId)
               FABRIC_ENVIRONMENT: $(environment)
@@ -211,8 +277,10 @@ stages:
   # Stage 3: Initialize Data (run notebook)
   - stage: Initialize_Data
     displayName: "Initialize Data"
-    dependsOn: Deploy_All_Artifacts
-    condition: eq('${{ parameters.deployMode }}', 'full')
+    dependsOn:
+      - Deploy_All_Artifacts
+      - Selective_Deployment
+    condition: and(not(failed()), eq('${{ parameters.runInitializeData }}', 'true'))
     jobs:
       - job: RunNotebook
         displayName: "Run Initialization Notebook"
@@ -249,7 +317,7 @@ stages:
   - stage: Create_SM_Connections
     displayName: "Create SM Connections"
     dependsOn: Initialize_Data
-    condition: not(failed())
+    condition: and(not(failed()), eq('${{ parameters.runCreateSMConnections }}', 'true'))
     jobs:
       - job: CreateConnections
         displayName: "Create Semantic Model Connections"
@@ -273,7 +341,7 @@ stages:
 
           - task: DownloadPipelineArtifact@2
             displayName: "Download Parameter YAML"
-            condition: eq('${{ parameters.deployMode }}', 'full')
+            condition: eq('${{ parameters.runCaptureArtifactIds }}', 'true')
             inputs:
               artifactName: "parameter_yml"
               targetPath: '$(Build.SourcesDirectory)'
@@ -287,7 +355,8 @@ stages:
               scriptPath: "$(Build.SourcesDirectory)/.deploy/create_sm_connections_stage.ps1"
               arguments: >-
                 -TargetWorkspaceName "$(targetWorkspaceName)"
-                -ConnectionMappingPath "$(Build.SourcesDirectory)/connection_mapping.$(environmentLower).json"
+                -ConnectionMappingPath "$(Build.SourcesDirectory)/.deploy/config/connection_mapping.yml"
+                -Environment "$(environmentLower)"
                 -GroupId "$(groupId)"
                 -UserIds "$(userIds)"
                 -ParameterYmlPath "$(Build.SourcesDirectory)/parameter.yml"
@@ -305,9 +374,7 @@ stages:
     dependsOn:
       - Validate_Branch
       - Create_SM_Connections
-    condition: not(failed())
-    variables:
-      projectName: $[ stageDependencies.Validate_Branch.ValidateBranch.outputs['detectConfig.projectName'] ]
+    condition: and(not(failed()), eq('${{ parameters.runDeploySemanticModels }}', 'true'))
     jobs:
       - job: DeploySM
         displayName: "Deploy Semantic Models"
@@ -337,11 +404,11 @@ stages:
                 echo "Installing fabric-cicd..."
                 pip install fabric-cicd==${{ variables.fabricCicdVersion }} || pip install fabric-cicd
 
-                echo "Deploying semantic models for project: $(projectName)"
+                echo "Deploying semantic models from selection: ${{ parameters.selectiveDeployConfig }}"
                 python .deploy/deploy_fabric.py \
                   --workspace-id "$(targetWorkspaceId)" \
                   --environment "$(environment)" \
-                  --project "$(projectName)" \
+                  --deploy-config "${{ parameters.selectiveDeployConfig }}" \
                   --items SemanticModel
             env:
               FABRIC_WORKSPACE_ID: $(targetWorkspaceId)

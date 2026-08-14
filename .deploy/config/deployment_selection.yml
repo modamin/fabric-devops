@@ -1,0 +1,18 @@
+# Selective deployment config for deploy_fabric.py
+#
+# Usage:
+#   python .deploy/deploy_fabric.py \
+#     --workspace-id "<workspace-id>" \
+#     --environment "UAT" \
+#     --deploy-config .deploy/config/deployment_selection.yml
+#
+# 'folders' : each listed folder AND all of its subfolders are deployed.
+#             The script traverses the repository folder structure, so
+#             subfolders do NOT need to be listed here.
+# 'files'   : individual items to deploy, in "item_name.item_type" format.
+
+folders:
+  - Project_D
+
+files:
+  - conn_mgmt_single_items_nb.Notebook

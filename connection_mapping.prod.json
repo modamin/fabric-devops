@@ -1,7 +1,0 @@
-[
-  {
-    "connection_name": "my-connection-1939",
-    "semantic_model_name": "conn_mgmt_sm",
-    "lakehouse_name": "conn_mgmt_lh"
-  }
-]
