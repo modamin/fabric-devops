@@ -20,7 +20,13 @@
     Switch to update parameter.yml with find_replace entries.
 
 .PARAMETER ParameterYmlPath
-    Path to parameter.yml. Defaults to <repo-root>/parameter.yml.
+    Path to parameter.yml. Defaults to <RepositoryDirectory>/parameter.yml.
+
+.PARAMETER RepositoryDirectory
+    Workspace definition root used to scope generated Dataflow file filters.
+
+.PARAMETER ExpectedWorkspaceId
+    Fail if WorkspaceName resolves to a different workspace.
 
 .EXAMPLE
     .\capture_artifact_ids.ps1 -WorkspaceName "cicd-conn-mgmt-dev" -OutputPath ".\artifact_mapping.json"
@@ -34,7 +40,9 @@ param(
     [Parameter(Mandatory)][string]$WorkspaceName,
     [string]$OutputPath,
     [switch]$UpdateParameterYml,
-    [string]$ParameterYmlPath
+    [string]$ParameterYmlPath,
+    [string]$RepositoryDirectory,
+    [string]$ExpectedWorkspaceId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,7 +69,8 @@ $DATA_OBJECT_TYPES = @(
     "Eventhouse",
     "KQLDatabase",
     "MirroredDatabase",
-    "SQLDatabase"
+    "SQLDatabase",
+    "SemanticModel"
 )
 
 # Fabric auto-generates hidden system items (e.g. the staging Lakehouse/Warehouse
@@ -74,7 +83,11 @@ $SYSTEM_ITEM_PATTERNS = @(
 
 # Resolve default paths
 $deployDir = $PSScriptRoot
-$rootDir = Split-Path $deployDir -Parent
+$rootDir = if ($RepositoryDirectory) {
+    (Resolve-Path -LiteralPath $RepositoryDirectory).Path
+} else {
+    Join-Path (Split-Path $deployDir -Parent) "workspaces/data"
+}
 
 if (-not $OutputPath) {
     $OutputPath = Join-Path $deployDir "artifact_mapping.json"
@@ -87,28 +100,34 @@ if ($UpdateParameterYml -and -not $ParameterYmlPath) {
 Write-Host "Capturing artifacts from workspace: $WorkspaceName"
 
 [string]$workspacePath = "$WorkspaceName.Workspace"
-Write-Host "Running: fab ls $workspacePath -l --output_format json"
-$rawOutput = fab ls $workspacePath -l --output_format json
-$response = ConvertFrom-FabJson $rawOutput
-
-if (-not $response) {
-    throw "Fabric CLI returned no parseable JSON for '$workspacePath'. Raw output: $(($rawOutput -join ' ').Trim())"
-}
-if ($response.status -ne "Success") {
-    throw "Fabric CLI returned status: $($response.status)"
-}
-
-$allItems = $response.result.data
-
 # --- Capture workspace ID ---
 Write-Host "Capturing workspace ID..."
 $rawWs = fab get $workspacePath -q .
+if ($LASTEXITCODE -ne 0) { throw "Failed to resolve workspace '$WorkspaceName'." }
 $wsJson = ConvertFrom-FabJson $rawWs
 if (-not $wsJson) {
     throw "Could not parse workspace metadata for '$workspacePath'. Raw output: $(($rawWs -join ' ').Trim())"
 }
 $workspaceId = $wsJson.id
+if (-not $workspaceId) { throw "Workspace metadata is missing its ID." }
+if ($ExpectedWorkspaceId -and $workspaceId -ne $ExpectedWorkspaceId) {
+    throw "Workspace '$WorkspaceName' resolved to '$workspaceId', expected '$ExpectedWorkspaceId'."
+}
 Write-Host "  Workspace ID: $workspaceId"
+
+$accessToken = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
+if ($LASTEXITCODE -ne 0 -or -not $accessToken) { throw "Failed to acquire a Fabric API token." }
+$headers = @{ Authorization = "Bearer $accessToken" }
+$allItems = @()
+$nextUrl = "https://api.fabric.microsoft.com/v1/workspaces/$workspaceId/items"
+do {
+    if (-not $nextUrl.StartsWith("https://api.fabric.microsoft.com/v1/")) {
+        throw "Unexpected Fabric continuation URL."
+    }
+    $page = Invoke-RestMethod -Uri $nextUrl -Headers $headers
+    $allItems += @($page.value)
+    $nextUrl = $page.continuationUri
+} while ($nextUrl)
 
 # --- Filter and categorize items ---
 $mapping = [ordered]@{
@@ -119,17 +138,11 @@ $mapping = [ordered]@{
 }
 
 foreach ($item in $allItems) {
-    $fullName = $item.name
     $itemId = $item.id
-
-    # Parse "name.Type" format — split on last dot
-    $lastDot = $fullName.LastIndexOf(".")
-    if ($lastDot -gt 0) {
-        $itemName = $fullName.Substring(0, $lastDot)
-        $itemType = $fullName.Substring($lastDot + 1)
-    } else {
-        $itemName = $fullName
-        $itemType = ""
+    $itemName = $item.displayName
+    $itemType = $item.type
+    if (-not $itemId -or -not $itemName -or -not $itemType) {
+        throw "Fabric returned an item with incomplete metadata."
     }
 
     # Skip SQLEndpoint items — we get connectionString and id from fab get on the Lakehouse
@@ -146,6 +159,9 @@ foreach ($item in $allItems) {
         if (-not $mapping.items.Contains($itemType)) {
             $mapping.items[$itemType] = [ordered]@{}
         }
+        if ($mapping.items[$itemType].Contains($itemName)) {
+            throw "Ambiguous item name '$itemName' ($itemType) in '$WorkspaceName'."
+        }
         $mapping.items[$itemType][$itemName] = [ordered]@{
             id   = $itemId
             type = $itemType
@@ -160,16 +176,7 @@ foreach ($item in $allItems) {
 
             for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
                 try {
-                    $rawLh = fab get $lhPath -q .
-                    $lhJson = ConvertFrom-FabJson $rawLh
-
-                    if (-not $lhJson) {
-                        $snippet = ($rawLh -join ' ').Trim()
-                        if ($snippet.Length -gt 200) { $snippet = $snippet.Substring(0, 200) + '...' }
-                        Write-Host "    Attempt ${attempt}/${maxAttempts}: no JSON from 'fab get $lhPath' (raw: $snippet)"
-                        Start-Sleep -Seconds 10
-                        continue
-                    }
+                    $lhJson = Invoke-RestMethod -Uri "https://api.fabric.microsoft.com/v1/workspaces/$workspaceId/lakehouses/$itemId" -Headers $headers
 
                     $sqlEndpointProps = $lhJson.properties.sqlEndpointProperties
                     $rawConnString = $sqlEndpointProps.connectionString
@@ -180,7 +187,7 @@ foreach ($item in $allItems) {
                     }
                     if ($sqlId) { $sqlProps.id = $sqlId }
 
-                    if ($sqlProps.Count -gt 0) { break }
+                    if ($sqlProps.connectionString -and $sqlProps.id) { break }
 
                     # Item exists but the SQL analytics endpoint hasn't populated yet.
                     Write-Host "    Attempt ${attempt}/${maxAttempts}: SQL endpoint for ${itemName} not populated yet"

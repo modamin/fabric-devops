@@ -1,109 +1,150 @@
 <#
 .SYNOPSIS
-    Reusable functions for creating and managing Fabric Semantic Model connections.
-
+    Create OneLake semantic model connections using workspace identity, without SSO.
 .DESCRIPTION
-    Provides functions to query lakehouse SQL endpoints, create Fabric connections,
-    and grant role access. Dot-source this script to import the functions.
-
-.EXAMPLE
-    . "$PSScriptRoot/create_sm_connection.ps1"
-    $endpoint = Get-LakehouseSqlEndpoint -WorkspaceName "my-ws" -LakehouseName "my-lh"
-    $connId = New-FabricConnection -ConnectionName "my-conn" -SqlServer $endpoint.Server -SqlDatabase $endpoint.Database
-    Grant-FabricConnectionAccess -ConnectionId $connId -GroupId "aad-group-id"
+    Dot-source this script to import the Fabric REST connection helpers.
+    WorkspaceIdentity credentials use the consuming semantic model's workspace identity.
 #>
 
-function Get-LakehouseSqlEndpoint {
-    <#
-    .SYNOPSIS
-        Query SQL endpoint properties for a lakehouse.
-    .OUTPUTS
-        Hashtable with Server and Database keys.
-    #>
+function Invoke-FabricConnectionApi {
     param(
-        [Parameter(Mandatory)][string]$WorkspaceName,
-        [Parameter(Mandatory)][string]$LakehouseName
+        [Parameter(Mandatory)][string]$Uri,
+        [ValidateSet('Get', 'Post', 'Patch')][string]$Method = 'Get',
+        [hashtable]$Body
     )
 
-    Write-Host "Querying SQL endpoint for $LakehouseName in workspace $WorkspaceName..."
-    [string]$lakehousePath = "$WorkspaceName.Workspace/$LakehouseName.Lakehouse"
-
-    $server = fab get $lakehousePath -q 'properties.sqlEndpointProperties.connectionString'
-    $database = fab get $lakehousePath -q 'properties.sqlEndpointProperties.id'
-
-    Write-Host "SQL Server: $server"
-    Write-Host "SQL Database: $database"
-
-    return @{
-        Server   = $server
-        Database = $database
+    if (-not $Uri.StartsWith('https://api.fabric.microsoft.com/v1/')) {
+        throw "Unexpected Fabric API URL: $Uri"
     }
+    $token = az account get-access-token --resource 'https://api.fabric.microsoft.com' --query accessToken -o tsv
+    if ($LASTEXITCODE -ne 0 -or -not $token) { throw 'Failed to acquire a Fabric API token.' }
+    $arguments = @{
+        Uri = $Uri
+        Method = $Method
+        Headers = @{ Authorization = "Bearer $token" }
+        ErrorAction = 'Stop'
+    }
+    if ($Body) {
+        $arguments.ContentType = 'application/json'
+        $arguments.Body = $Body | ConvertTo-Json -Depth 20 -Compress
+    }
+    try {
+        Invoke-RestMethod @arguments
+    } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+        throw "Fabric API $Method $Uri failed: $($_.ErrorDetails.Message)"
+    }
+}
+
+function Get-FabricConnectionApiItems {
+    param([Parameter(Mandatory)][string]$Uri)
+
+    do {
+        $page = Invoke-FabricConnectionApi -Uri $Uri
+        if ($null -eq $page.value) { throw "Fabric list response is missing 'value': $Uri" }
+        $page.value
+        $Uri = $page.continuationUri
+    } while ($Uri)
+}
+
+function Assert-FabricOneLakeConnection {
+    param(
+        [Parameter(Mandatory)]$Connection,
+        [Parameter(Mandatory)][string]$OneLakeUrl
+    )
+
+    if ($Connection.connectivityType -ne 'ShareableCloud' -or
+        $Connection.connectionDetails.type -ne 'AzureDataLakeStorage' -or
+        ([string]$Connection.connectionDetails.path).TrimEnd('/') -ine $OneLakeUrl.TrimEnd('/') -or
+        $Connection.credentialDetails.credentialType -ne 'WorkspaceIdentity' -or
+        $Connection.credentialDetails.singleSignOnType -ne 'None') {
+        throw "Connection '$($Connection.displayName)' must be a shareable OneLake connection to '$OneLakeUrl', with WorkspaceIdentity authentication and SSO disabled. Correct it explicitly or use a different connection name."
+    }
+    if (-not $Connection.id) { throw 'Fabric connection response is missing its ID.' }
 }
 
 function New-FabricConnection {
-    <#
-    .SYNOPSIS
-        Create or retrieve a Fabric SQL connection.
-    .OUTPUTS
-        Connection ID (string).
-    #>
     param(
         [Parameter(Mandatory)][string]$ConnectionName,
-        [Parameter(Mandatory)][string]$SqlServer,
-        [Parameter(Mandatory)][string]$SqlDatabase
+        [Parameter(Mandatory)][string]$OneLakeUrl
     )
 
-    [string]$connectionPath = ".connections/$ConnectionName.Connection"
-    Write-Host "Checking for existing connection '$ConnectionName'..."
-    $connectionExists = (fab exists $connectionPath) -join ""
-    Write-Host "Connection exists: $connectionExists"
-
-    if ($connectionExists -eq "true") {
-        Write-Host "Connection '$ConnectionName' already exists."
-        $connectionId = fab get $connectionPath -q 'id'
-        Write-Host "Connection ID: $connectionId"
-        return $connectionId
+    if ($OneLakeUrl -notmatch '^https://onelake\.dfs\.fabric\.microsoft\.com/[0-9a-f-]{36}/[0-9a-f-]{36}/?$') {
+        throw "Expected a workspace/lakehouse GUID-based OneLake URL, got '$OneLakeUrl'."
+    }
+    $base = 'https://api.fabric.microsoft.com/v1'
+    Write-Host "Checking for existing OneLake connection '$ConnectionName'..."
+    $existing = @(Get-FabricConnectionApiItems -Uri "$base/connections" |
+        Where-Object displayName -eq $ConnectionName)
+    if ($existing.Count -gt 1) { throw "Ambiguous connection name '$ConnectionName'." }
+    if ($existing.Count -eq 1) {
+        $connection = Invoke-FabricConnectionApi -Uri "$base/connections/$($existing[0].id)"
+        Assert-FabricOneLakeConnection -Connection $connection -OneLakeUrl $OneLakeUrl
+        Write-Host "Reusing OneLake connection: $($connection.id)"
+        return $connection.id
     }
 
-    Write-Host "Creating connection '$ConnectionName'..."
-    $params = @(
-        "connectionDetails.type=SQL",
-        "connectionDetails.parameters.server=$SqlServer",
-        "connectionDetails.parameters.database=$SqlDatabase",
-        "credentialDetails.type=ServicePrincipal",
-        "credentialDetails.tenantId=$env:FAB_TENANT_ID",
-        "credentialDetails.servicePrincipalClientId=$env:FAB_CLIENT_ID",
-        "credentialDetails.servicePrincipalSecret=$env:FAB_CLIENT_SECRET",
-        "credentialDetails.singleSignOnType=None",
-        "credentialDetails.skipTestConnection=False"
-    ) -join ","
+    $types = @(Get-FabricConnectionApiItems -Uri "$base/connections/supportedConnectionTypes?showAllCreationMethods=true" |
+        Where-Object type -eq 'AzureDataLakeStorage')
+    if ($types.Count -ne 1 -or 'WorkspaceIdentity' -notin $types[0].supportedCredentialTypes) {
+        throw 'Fabric does not advertise AzureDataLakeStorage connections with WorkspaceIdentity authentication for this caller.'
+    }
+    $methods = @($types[0].creationMethods | Where-Object {
+        $serverParameter = @($_.parameters | Where-Object { $_.name -eq 'server' -and $_.dataType -eq 'Text' })
+        $pathParameter = @($_.parameters | Where-Object { $_.name -eq 'path' -and $_.dataType -eq 'Text' })
+        $otherRequired = @($_.parameters | Where-Object { $_.required -and $_.name -notin @('server', 'path') })
+        $serverParameter.Count -eq 1 -and $pathParameter.Count -eq 1 -and $otherRequired.Count -eq 0
+    })
+    if ($methods.Count -ne 1) {
+        $metadata = $types[0].creationMethods | ConvertTo-Json -Depth 10 -Compress
+        throw "Fabric did not return an unambiguous AzureDataLakeStorage creation method with text server/path parameters. Returned creation methods: $metadata"
+    }
 
-    fab create $connectionPath -P $params | Out-Null
-
-    Write-Host "Retrieving connection ID..."
-    $connectionId = fab get $connectionPath -q 'id'
-    Write-Host "Connection ID: $connectionId"
-
-    return $connectionId
+    $sourceUri = [uri]$OneLakeUrl
+    $body = @{
+        connectivityType = 'ShareableCloud'
+        displayName = $ConnectionName
+        privacyLevel = 'Organizational'
+        connectionDetails = @{
+            type = 'AzureDataLakeStorage'
+            creationMethod = $methods[0].name
+            parameters = @(
+                @{ dataType = 'Text'; name = 'server'; value = $sourceUri.GetLeftPart([System.UriPartial]::Authority) }
+                @{ dataType = 'Text'; name = 'path'; value = $sourceUri.AbsolutePath.TrimStart('/') }
+            )
+        }
+        credentialDetails = @{
+            credentials = @{ credentialType = 'WorkspaceIdentity' }
+            singleSignOnType = 'None'
+            skipTestConnection = ($types[0].supportsSkipTestConnection -eq $true)
+        }
+    }
+    Write-Host "Creating OneLake connection '$ConnectionName' (WorkspaceIdentity, SSO disabled)..."
+    $created = Invoke-FabricConnectionApi -Uri "$base/connections" -Method Post -Body $body
+    if (-not $created.id) { throw "Created connection '$ConnectionName' did not return an ID." }
+    $connection = Invoke-FabricConnectionApi -Uri "$base/connections/$($created.id)"
+    Assert-FabricOneLakeConnection -Connection $connection -OneLakeUrl $OneLakeUrl
+    return $connection.id
 }
 
 function Grant-FabricConnectionAccess {
-    <#
-    .SYNOPSIS
-        Grant Owner role on a connection to an AAD principal (Group or User).
-    .PARAMETER PrincipalType
-        Type of principal: 'Group' or 'User'. Defaults to 'Group'.
-    #>
     param(
         [Parameter(Mandatory)][string]$ConnectionId,
         [Parameter(Mandatory)][string]$PrincipalId,
         [ValidateSet('Group', 'User')][string]$PrincipalType = 'Group'
     )
 
-    Write-Host "Granting access to connection $ConnectionId for $PrincipalType $PrincipalId..."
-    $apiUrl = "connections/$ConnectionId/roleAssignments"
-    $payload = '{"principal":{"id":"' + $PrincipalId + '","type":"' + $PrincipalType + '"},"role":"Owner"}'
-    Write-Host "API URL: $apiUrl"
-    Write-Host "Payload: $payload"
-    fab api -X post $apiUrl -H "Content-Type=application/json" -i $payload | Out-Null
+    Write-Host "Granting Owner access to connection $ConnectionId for $PrincipalType $PrincipalId..."
+    $uri = "https://api.fabric.microsoft.com/v1/connections/$ConnectionId/roleAssignments"
+    $existing = @(Get-FabricConnectionApiItems -Uri $uri |
+        Where-Object { $_.principal.id -eq $PrincipalId })
+    if ($existing.Count -gt 1) { throw "Ambiguous connection role for $PrincipalId." }
+    if ($existing.Count -eq 1) {
+        if ($existing[0].role -eq 'Owner') { return }
+        Invoke-FabricConnectionApi -Uri "$uri/$($existing[0].id)" -Method Patch -Body @{ role = 'Owner' } | Out-Null
+        return
+    }
+    Invoke-FabricConnectionApi -Uri $uri -Method Post -Body @{
+        principal = @{ id = $PrincipalId; type = $PrincipalType }
+        role = 'Owner'
+    } | Out-Null
 }

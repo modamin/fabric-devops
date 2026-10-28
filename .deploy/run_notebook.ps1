@@ -37,7 +37,7 @@ $fabricApiBase = "https://api.fabric.microsoft.com/v1"
 # --- Get bearer token from Azure CLI session ---
 Write-Host "Acquiring bearer token from Azure CLI..."
 $accessToken = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
-if (-not $accessToken) {
+if ($LASTEXITCODE -ne 0 -or -not $accessToken) {
     throw "Failed to acquire access token from Azure CLI. Ensure the task runs inside AzureCLI@2."
 }
 $headers = @{ "Authorization" = "Bearer $accessToken" }
@@ -49,11 +49,13 @@ Write-Host "=== Running notebook: $NotebookName in workspace: $WorkspaceName ===
 Write-Host "Resolving workspace ID..."
 [string]$workspacePath = "$WorkspaceName.Workspace"
 $workspaceId = fab get $workspacePath -q 'id'
+if ($LASTEXITCODE -ne 0 -or -not $workspaceId) { throw "Failed to resolve the data workspace." }
 Write-Host "  Workspace ID: $workspaceId"
 
 Write-Host "Resolving notebook ID..."
 [string]$notebookPath = "$WorkspaceName.Workspace/$NotebookName.Notebook"
 $notebookId = fab get $notebookPath -q 'id'
+if ($LASTEXITCODE -ne 0 -or -not $notebookId) { throw "Initialization notebook is missing from the data workspace." }
 Write-Host "  Notebook ID: $notebookId"
 
 # --- Trigger notebook run ---

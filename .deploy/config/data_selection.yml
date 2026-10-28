@@ -1,0 +1,9 @@
+# Paths are relative to workspaces/data, not the repository root.
+# Project_B supplies the data dependencies of the default BI selection.
+
+folders:
+  - Project_B
+  - Project_D
+
+files:
+  - conn_mgmt_single_items_nb.Notebook
